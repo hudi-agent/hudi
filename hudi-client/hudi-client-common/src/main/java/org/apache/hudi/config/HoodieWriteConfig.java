@@ -2002,6 +2002,10 @@ public class HoodieWriteConfig extends HoodieConfig {
     return getInt(HoodieArchivalConfig.COMMITS_ARCHIVAL_BATCH_SIZE);
   }
 
+  public boolean shouldBlockArchivalOnCleanECTR() {
+    return getBoolean(HoodieArchivalConfig.BLOCK_ARCHIVAL_ON_LATEST_CLEAN_ECTR);
+  }
+
   public Boolean shouldCleanBootstrapBaseFile() {
     return getBoolean(HoodieCleanConfig.CLEANER_BOOTSTRAP_BASE_FILE_ENABLE);
   }

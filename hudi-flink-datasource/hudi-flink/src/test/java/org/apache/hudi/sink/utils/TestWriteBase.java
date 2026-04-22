@@ -186,6 +186,17 @@ public class TestWriteBase {
       return this;
     }
 
+    public TestHarness preparePipelineWithObjectReuse(File basePath, Configuration conf) throws Exception {
+      this.baseFile = basePath;
+      this.basePath = this.baseFile.getAbsolutePath();
+      this.conf = conf;
+      this.pipeline = TestData.getWritePipelineWithObjectReuse(this.basePath, conf);
+      // open the function and ingest data
+      this.pipeline.openFunction();
+      HoodieWriteConfig writeConfig = this.pipeline.getCoordinator().getWriteClient().getConfig();
+      return this;
+    }
+
     public TestHarness consume(List<RowData> inputs) throws Exception {
       for (RowData rowData : inputs) {
         this.pipeline.invoke(rowData);
