@@ -171,6 +171,10 @@ public class TableSchemaResolver {
         (instantOpt.isPresent()
             ? getTableSchemaFromCommitMetadata(instantOpt.get(), includeMetadataFields)
             : getTableSchemaFromLatestCommitMetadata(includeMetadataFields))
+            // Fallback: look in ANY commit type (clustering, compaction, delete_partition, etc.)
+            .or(() -> getTableSchemaFromAnyCommitMetadata(includeMetadataFields))
+            // Fallback: look in clean instants' extraMetadata (populated by rolling metadata)
+            .or(() -> getTableSchemaFromCleanMetadata(includeMetadataFields))
             .or(() ->
                 metaClient.getTableConfig().getTableCreateSchema()
                     .map(tableSchema ->
@@ -199,36 +203,71 @@ public class TableSchemaResolver {
   private Option<HoodieSchema> getTableSchemaFromLatestCommitMetadata(boolean includeMetadataFields) {
     Option<Pair<HoodieInstant, HoodieCommitMetadata>> instantAndCommitMetadata = getLatestCommitMetadataWithValidSchema();
     if (instantAndCommitMetadata.isPresent()) {
-      HoodieCommitMetadata commitMetadata = instantAndCommitMetadata.get().getRight();
-      String schemaStr = commitMetadata.getMetadata(HoodieCommitMetadata.SCHEMA_KEY);
-      HoodieSchema schema = HoodieSchema.parse(schemaStr);
-      if (includeMetadataFields) {
-        schema = HoodieSchemaUtils.addMetadataFields(schema, hasOperationField.get());
-      } else {
-        schema = HoodieSchemaUtils.removeMetadataFields(schema);
-      }
-      return Option.of(schema);
-    } else {
+      String schemaStr = instantAndCommitMetadata.get().getRight().getMetadata(HoodieCommitMetadata.SCHEMA_KEY);
+      return parseSchemaString(schemaStr, includeMetadataFields);
+    }
+    return Option.empty();
+  }
+
+  /**
+   * Fallback: find schema from ANY commit type (including clustering, compaction, delete_partition)
+   * regardless of {@link WriteOperationType#canUpdateSchema}.
+   */
+  private Option<HoodieSchema> getTableSchemaFromAnyCommitMetadata(boolean includeMetadataFields) {
+    Option<Pair<HoodieInstant, HoodieCommitMetadata>> instantAndCommitMetadata =
+        metaClient.getActiveTimeline().getLastCommitMetadataWithSchema();
+    if (instantAndCommitMetadata.isPresent()) {
+      String schemaStr = instantAndCommitMetadata.get().getRight().getMetadata(HoodieCommitMetadata.SCHEMA_KEY);
+      return parseSchemaString(schemaStr, includeMetadataFields);
+    }
+    return Option.empty();
+  }
+
+  /**
+   * Fallback: find schema from clean instants' extraMetadata. This is populated by the
+   * rolling metadata feature when schema is configured as a rolling key.
+   */
+  private Option<HoodieSchema> getTableSchemaFromCleanMetadata(boolean includeMetadataFields) {
+    HoodieTimeline cleanerTimeline = metaClient.getActiveTimeline().getCleanerTimeline().filterCompletedInstants();
+    if (cleanerTimeline.empty()) {
       return Option.empty();
     }
+    return cleanerTimeline.getReverseOrderedInstants()
+        .map(instant -> {
+          try {
+            return cleanerTimeline.readCleanMetadata(instant);
+          } catch (IOException e) {
+            throw new HoodieIOException("Failed to read clean metadata for instant " + instant.requestedTime(), e);
+          }
+        })
+        .filter(cleanMeta -> cleanMeta.getExtraMetadata() != null)
+        .map(cleanMeta -> cleanMeta.getExtraMetadata().get(HoodieCommitMetadata.SCHEMA_KEY))
+        .filter(schemaStr -> !StringUtils.isNullOrEmpty(schemaStr))
+        .map(schemaStr -> parseSchemaString(schemaStr, includeMetadataFields))
+        .filter(Option::isPresent)
+        .map(Option::get)
+        .findFirst()
+        .map(Option::of)
+        .orElse(Option.empty());
+  }
+
+  private Option<HoodieSchema> parseSchemaString(String schemaStr, boolean includeMetadataFields) {
+    if (StringUtils.isNullOrEmpty(schemaStr)) {
+      return Option.empty();
+    }
+    HoodieSchema schema = HoodieSchema.parse(schemaStr);
+    if (includeMetadataFields) {
+      schema = HoodieSchemaUtils.addMetadataFields(schema, hasOperationField.get());
+    } else {
+      schema = HoodieSchemaUtils.removeMetadataFields(schema);
+    }
+    return Option.of(schema);
   }
 
   private Option<HoodieSchema> getTableSchemaFromCommitMetadata(HoodieInstant instant, boolean includeMetadataFields) {
     try {
       HoodieCommitMetadata metadata = getCachedCommitMetadata(instant);
-      String existingSchemaStr = metadata.getMetadata(HoodieCommitMetadata.SCHEMA_KEY);
-
-      if (StringUtils.isNullOrEmpty(existingSchemaStr)) {
-        return Option.empty();
-      }
-
-      HoodieSchema schema = HoodieSchema.parse(existingSchemaStr);
-      if (includeMetadataFields) {
-        schema = HoodieSchemaUtils.addMetadataFields(schema, hasOperationField.get());
-      } else {
-        schema = HoodieSchemaUtils.removeMetadataFields(schema);
-      }
-      return Option.of(schema);
+      return parseSchemaString(metadata.getMetadata(HoodieCommitMetadata.SCHEMA_KEY), includeMetadataFields);
     } catch (Exception e) {
       throw new HoodieException("Failed to read schema from commit metadata", e);
     }

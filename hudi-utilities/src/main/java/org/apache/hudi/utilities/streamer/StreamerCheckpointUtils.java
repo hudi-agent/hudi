@@ -19,6 +19,7 @@
 
 package org.apache.hudi.utilities.streamer;
 
+import org.apache.hudi.avro.model.HoodieCleanMetadata;
 import org.apache.hudi.common.config.TypedProperties;
 import org.apache.hudi.common.model.HoodieCommitMetadata;
 import org.apache.hudi.common.model.HoodieTableType;
@@ -43,6 +44,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.Map;
 
 import static org.apache.hudi.common.table.checkpoint.CheckpointUtils.HOODIE_INCREMENTAL_SOURCES;
 import static org.apache.hudi.common.table.checkpoint.CheckpointUtils.buildCheckpointFromConfigOverride;
@@ -81,6 +83,12 @@ public class StreamerCheckpointUtils {
     // checkpoint resolution logic to resolve conflicting configurations.
     if (commitsTimelineOpt.isPresent()) {
       checkpoint = resolveCheckpointBetweenConfigAndPrevCommit(commitsTimelineOpt.get(), streamerConfig, props);
+    }
+    // Fallback: if no checkpoint found in commits timeline, check clean instants' extraMetadata.
+    // Clean instants carry rolled-over metadata when rolling metadata is configured.
+    // Skip this fallback when --ignore-checkpoint is set, since the user explicitly wants a fresh start.
+    if (!checkpoint.isPresent() && streamerConfig.ignoreCheckpoint == null) {
+      checkpoint = getCheckpointFromCleanInstants(metaClient);
     }
     // If there is only streamer config, extract the checkpoint directly.
     checkpoint = useCkpFromOverrideConfigIfAny(streamerConfig, props, checkpoint);
@@ -230,5 +238,41 @@ public class StreamerCheckpointUtils {
         throw new HoodieIOException("failed to get latest instant with ValidCheckpointInfo", e);
       }
     }).orElse(Option.empty());
+  }
+
+  /**
+   * Fallback: search clean instants' extraMetadata for checkpoint keys.
+   * This covers the case where rolling metadata was not configured on other commit types
+   * (e.g., clustering, compaction), so checkpoint info was only rolled into clean commits.
+   * After archival removes all ingestion commits, clean instants may be the only source
+   * of checkpoint metadata on the active timeline.
+   */
+  private static Option<Checkpoint> getCheckpointFromCleanInstants(HoodieTableMetaClient metaClient) {
+    HoodieTimeline cleanerTimeline = metaClient.getActiveTimeline().getCleanerTimeline().filterCompletedInstants();
+    if (cleanerTimeline.empty()) {
+      return Option.empty();
+    }
+    return Option.fromJavaOptional(
+        cleanerTimeline.getReverseOrderedInstants()
+            .map(instant -> {
+              try {
+                HoodieCleanMetadata cleanMetadata = cleanerTimeline.readCleanMetadata(instant);
+                Map<String, String> extraMetadata = cleanMetadata.getExtraMetadata();
+                if (extraMetadata == null) {
+                  return null;
+                }
+                if (CheckpointUtils.hasCheckpointKeys(extraMetadata)) {
+                  Checkpoint checkpoint = CheckpointUtils.getCheckpoint(extraMetadata);
+                  if (!StringUtils.isNullOrEmpty(checkpoint.getCheckpointKey())) {
+                    return checkpoint;
+                  }
+                }
+              } catch (IOException e) {
+                throw new HoodieIOException("Failed to read clean metadata for instant " + instant.requestedTime(), e);
+              }
+              return null;
+            })
+            .filter(cp -> cp != null)
+            .findFirst());
   }
 }

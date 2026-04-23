@@ -662,4 +662,166 @@ class TestTimelineUtils extends HoodieCommonTestHarness {
     droppedPartitions = TimelineUtils.getDroppedPartitions(metaClient, Option.empty(), Option.empty());
     assertTrue(droppedPartitions.isEmpty());
   }
+
+  @Test
+  void testGetExtraMetadataFallsBackToCleanInstants() throws Exception {
+    String extraMetadataKey = "checkpoint_key";
+    String extraMetadataValue = "kafka:topic:0:100";
+    HoodieActiveTimeline activeTimeline = metaClient.getActiveTimeline();
+
+    // Create a clean instant with extraMetadata containing the checkpoint key
+    Map<String, String> cleanExtraMetadata = new HashMap<>();
+    cleanExtraMetadata.put(extraMetadataKey, extraMetadataValue);
+    HoodieInstant cleanInstant = new HoodieInstant(INFLIGHT, CLEAN_ACTION, "1",
+        InstantComparatorV2.REQUESTED_TIME_BASED_COMPARATOR);
+    activeTimeline.createNewInstant(cleanInstant);
+    activeTimeline.saveAsComplete(cleanInstant, getCleanMetadataWithExtraMetadata("p1", "1", cleanExtraMetadata));
+
+    metaClient.reloadActiveTimeline();
+
+    // No commits exist, so getExtraMetadataFromLatest should fall back to clean instants
+    Option<String> result = TimelineUtils.getExtraMetadataFromLatest(metaClient, extraMetadataKey);
+    assertTrue(result.isPresent(), "Should find metadata in clean instant fallback");
+    assertEquals(extraMetadataValue, result.get());
+  }
+
+  @Test
+  void testGetExtraMetadataIncludeClusteringFallsBackToCleanInstants() throws Exception {
+    String extraMetadataKey = "my_checkpoint";
+    String extraMetadataValue = "offset_42";
+    HoodieActiveTimeline activeTimeline = metaClient.getActiveTimeline();
+
+    // Create a clean instant with extraMetadata
+    Map<String, String> cleanExtraMetadata = new HashMap<>();
+    cleanExtraMetadata.put(extraMetadataKey, extraMetadataValue);
+    HoodieInstant cleanInstant = new HoodieInstant(INFLIGHT, CLEAN_ACTION, "1",
+        InstantComparatorV2.REQUESTED_TIME_BASED_COMPARATOR);
+    activeTimeline.createNewInstant(cleanInstant);
+    activeTimeline.saveAsComplete(cleanInstant, getCleanMetadataWithExtraMetadata("p1", "1", cleanExtraMetadata));
+
+    metaClient.reloadActiveTimeline();
+
+    Option<String> result = TimelineUtils.getExtraMetadataFromLatestIncludeClustering(metaClient, extraMetadataKey);
+    assertTrue(result.isPresent(), "Should find metadata in clean instant fallback (include clustering path)");
+    assertEquals(extraMetadataValue, result.get());
+  }
+
+  @Test
+  void testGetExtraMetadataCommitTakesPriorityOverClean() throws Exception {
+    String extraMetadataKey = "checkpoint_key";
+    String commitValue = "from_commit";
+    String cleanValue = "from_clean";
+    HoodieActiveTimeline activeTimeline = metaClient.getActiveTimeline();
+
+    // Create a commit with the key
+    Map<String, String> commitExtra = new HashMap<>();
+    commitExtra.put(extraMetadataKey, commitValue);
+    HoodieInstant commitInstant = new HoodieInstant(INFLIGHT, COMMIT_ACTION, "1",
+        InstantComparatorV2.REQUESTED_TIME_BASED_COMPARATOR);
+    activeTimeline.createNewInstant(commitInstant);
+    activeTimeline.saveAsComplete(commitInstant, getCommitMetadata(basePath, "1", "1", 2, commitExtra));
+
+    // Also create a clean with a different value
+    Map<String, String> cleanExtra = new HashMap<>();
+    cleanExtra.put(extraMetadataKey, cleanValue);
+    HoodieInstant cleanInstant = new HoodieInstant(INFLIGHT, CLEAN_ACTION, "2",
+        InstantComparatorV2.REQUESTED_TIME_BASED_COMPARATOR);
+    activeTimeline.createNewInstant(cleanInstant);
+    activeTimeline.saveAsComplete(cleanInstant, getCleanMetadataWithExtraMetadata("p1", "2", cleanExtra));
+
+    metaClient.reloadActiveTimeline();
+
+    // Commit value should take priority
+    Option<String> result = TimelineUtils.getExtraMetadataFromLatest(metaClient, extraMetadataKey);
+    assertTrue(result.isPresent());
+    assertEquals(commitValue, result.get());
+  }
+
+  @Test
+  void testGetExtraMetadataCleanFallbackReturnsEmptyWhenKeyNotPresent() throws Exception {
+    HoodieActiveTimeline activeTimeline = metaClient.getActiveTimeline();
+
+    // Create a clean instant without the target key
+    Map<String, String> cleanExtraMetadata = new HashMap<>();
+    cleanExtraMetadata.put("other_key", "other_value");
+    HoodieInstant cleanInstant = new HoodieInstant(INFLIGHT, CLEAN_ACTION, "1",
+        InstantComparatorV2.REQUESTED_TIME_BASED_COMPARATOR);
+    activeTimeline.createNewInstant(cleanInstant);
+    activeTimeline.saveAsComplete(cleanInstant, getCleanMetadataWithExtraMetadata("p1", "1", cleanExtraMetadata));
+
+    metaClient.reloadActiveTimeline();
+
+    Option<String> result = TimelineUtils.getExtraMetadataFromLatest(metaClient, "missing_key");
+    assertFalse(result.isPresent(), "Should not find metadata for a key that doesn't exist");
+  }
+
+  @Test
+  void testGetLastCommitMetadataWithSchemaIgnoresOperationType() throws Exception {
+    HoodieActiveTimeline activeTimeline = metaClient.getActiveTimeline();
+
+    // Create a clustering commit with schema
+    String schemaStr = "{\"type\":\"record\",\"name\":\"test\",\"fields\":[]}";
+    Map<String, String> extraMetadata = new HashMap<>();
+    extraMetadata.put(HoodieCommitMetadata.SCHEMA_KEY, schemaStr);
+    HoodieInstant clusterInstant = new HoodieInstant(INFLIGHT, CLUSTERING_ACTION, "1",
+        InstantComparatorV2.REQUESTED_TIME_BASED_COMPARATOR);
+    activeTimeline.createNewInstant(clusterInstant);
+    activeTimeline.transitionClusterInflightToComplete(true, clusterInstant,
+        getReplaceCommitMetadata(basePath, "1", "p1", 0, "p1", 3, extraMetadata, WriteOperationType.CLUSTER));
+
+    metaClient.reloadActiveTimeline();
+
+    // getLastCommitMetadataWithValidSchema should NOT find it (filtered by canUpdateSchema)
+    assertFalse(metaClient.getActiveTimeline().getLastCommitMetadataWithValidSchema().isPresent(),
+        "canUpdateSchema filter should exclude clustering");
+
+    // getLastCommitMetadataWithSchema SHOULD find it (no operation type filter)
+    assertTrue(metaClient.getActiveTimeline().getLastCommitMetadataWithSchema().isPresent(),
+        "getLastCommitMetadataWithSchema should find schema in clustering commit");
+    assertEquals(schemaStr,
+        metaClient.getActiveTimeline().getLastCommitMetadataWithSchema().get().getRight()
+            .getMetadata(HoodieCommitMetadata.SCHEMA_KEY));
+  }
+
+  @Test
+  void testGetLastCommitMetadataWithSchemaReturnsEmptyWhenNoSchema() throws Exception {
+    HoodieActiveTimeline activeTimeline = metaClient.getActiveTimeline();
+
+    // Create a commit without schema
+    HoodieInstant instant = new HoodieInstant(INFLIGHT, COMMIT_ACTION, "1",
+        InstantComparatorV2.REQUESTED_TIME_BASED_COMPARATOR);
+    activeTimeline.createNewInstant(instant);
+    activeTimeline.saveAsComplete(instant, getCommitMetadata(basePath, "1", "1", 2, Collections.emptyMap()));
+
+    metaClient.reloadActiveTimeline();
+
+    assertFalse(metaClient.getActiveTimeline().getLastCommitMetadataWithSchema().isPresent(),
+        "Should return empty when no commits have schema");
+  }
+
+  private Option<HoodieCleanMetadata> getCleanMetadataWithExtraMetadata(String partition, String time,
+                                                                        Map<String, String> extraMetadata) {
+    Map<String, HoodieCleanPartitionMetadata> partitionToFilesCleaned = new HashMap<>();
+    List<String> filesDeleted = new ArrayList<>();
+    filesDeleted.add("file-" + partition + "-" + time + "1");
+    HoodieCleanPartitionMetadata partitionMetadata = HoodieCleanPartitionMetadata.newBuilder()
+        .setPartitionPath(partition)
+        .setPolicy(HoodieCleaningPolicy.KEEP_LATEST_COMMITS.name())
+        .setFailedDeleteFiles(Collections.emptyList())
+        .setDeletePathPatterns(Collections.emptyList())
+        .setSuccessDeleteFiles(filesDeleted)
+        .setIsPartitionDeleted(false)
+        .build();
+    partitionToFilesCleaned.put(partition, partitionMetadata);
+    return Option.of(HoodieCleanMetadata.newBuilder()
+        .setVersion(1)
+        .setTimeTakenInMillis(100)
+        .setTotalFilesDeleted(1)
+        .setStartCleanTime(time)
+        .setEarliestCommitToRetain(time)
+        .setLastCompletedCommitTimestamp("")
+        .setPartitionMetadata(partitionToFilesCleaned)
+        .setExtraMetadata(extraMetadata)
+        .build());
+  }
 }

@@ -32,6 +32,7 @@ import org.apache.hudi.exception.HoodieException;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
@@ -69,6 +70,25 @@ public class CheckpointUtils {
       return new StreamerCheckpointV1(commitMetadata);
     }
     throw new HoodieException("Checkpoint is not found in the commit metadata: " + commitMetadata.getExtraMetadata());
+  }
+
+  public static Checkpoint getCheckpoint(Map<String, String> metadata) {
+    if (!StringUtils.isNullOrEmpty(metadata.get(STREAMER_CHECKPOINT_KEY_V2))
+        || !StringUtils.isNullOrEmpty(metadata.get(STREAMER_CHECKPOINT_RESET_KEY_V2))) {
+      return new StreamerCheckpointV2(metadata);
+    }
+    if (!StringUtils.isNullOrEmpty(metadata.get(STREAMER_CHECKPOINT_KEY_V1))
+        || !StringUtils.isNullOrEmpty(metadata.get(STREAMER_CHECKPOINT_RESET_KEY_V1))) {
+      return new StreamerCheckpointV1(metadata);
+    }
+    throw new HoodieException("Checkpoint is not found in the metadata: " + metadata);
+  }
+
+  public static boolean hasCheckpointKeys(Map<String, String> metadata) {
+    return !StringUtils.isNullOrEmpty(metadata.get(STREAMER_CHECKPOINT_KEY_V2))
+        || !StringUtils.isNullOrEmpty(metadata.get(STREAMER_CHECKPOINT_RESET_KEY_V2))
+        || !StringUtils.isNullOrEmpty(metadata.get(STREAMER_CHECKPOINT_KEY_V1))
+        || !StringUtils.isNullOrEmpty(metadata.get(STREAMER_CHECKPOINT_RESET_KEY_V1));
   }
 
   public static Checkpoint buildCheckpointFromGeneralSource(

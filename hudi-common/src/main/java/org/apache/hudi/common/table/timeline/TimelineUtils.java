@@ -234,23 +234,35 @@ public class TimelineUtils {
 
   /**
    * Get extra metadata for specified key from latest commit/deltacommit/replacecommit(eg. insert_overwrite) instant.
+   * Falls back to clean instants if the key is not found in any commit. This fallback is intentional:
+   * after archival removes all ingestion commits, clean instants carrying rolled-over metadata may
+   * be the only source for checkpoint/schema keys on the active timeline.
    */
   public static Option<String> getExtraMetadataFromLatest(HoodieTableMetaClient metaClient, String extraMetadataKey) {
-    return metaClient.getCommitsTimeline().filterCompletedInstants().getReverseOrderedInstants()
-        // exclude clustering commits for returning user stored extra metadata 
+    Option<String> result = metaClient.getCommitsTimeline().filterCompletedInstants().getReverseOrderedInstants()
+        // exclude clustering commits for returning user stored extra metadata
         .filter(instant -> !isClusteringCommit(metaClient, instant))
         .findFirst().map(instant ->
             getMetadataValue(metaClient, extraMetadataKey, instant)).orElse(Option.empty());
+    if (result.isPresent()) {
+      return result;
+    }
+    return getExtraMetadataFromCleanInstants(metaClient, extraMetadataKey);
   }
 
   /**
    * Get extra metadata for specified key from latest commit/deltacommit/replacecommit instant including internal commits
-   * such as clustering.
+   * such as clustering. Falls back to clean instants if the key is not found in any commit. See
+   * {@link #getExtraMetadataFromLatest} for rationale on the clean-instant fallback.
    */
   public static Option<String> getExtraMetadataFromLatestIncludeClustering(HoodieTableMetaClient metaClient, String extraMetadataKey) {
-    return metaClient.getCommitsTimeline().filterCompletedInstants().getReverseOrderedInstants()
+    Option<String> result = metaClient.getCommitsTimeline().filterCompletedInstants().getReverseOrderedInstants()
         .findFirst().map(instant ->
             getMetadataValue(metaClient, extraMetadataKey, instant)).orElse(Option.empty());
+    if (result.isPresent()) {
+      return result;
+    }
+    return getExtraMetadataFromCleanInstants(metaClient, extraMetadataKey);
   }
 
   /**
@@ -259,6 +271,36 @@ public class TimelineUtils {
   public static Map<String, Option<String>> getAllExtraMetadataForKey(HoodieTableMetaClient metaClient, String extraMetadataKey) {
     return metaClient.getCommitsTimeline().filterCompletedInstants().getReverseOrderedInstants().collect(Collectors.toMap(
         HoodieInstant::requestedTime, instant -> getMetadataValue(metaClient, extraMetadataKey, instant)));
+  }
+
+  /**
+   * Search clean instants' extraMetadata for a given key. Returns the value from the most
+   * recent clean instant that contains a non-empty value for the key.
+   */
+  private static Option<String> getExtraMetadataFromCleanInstants(HoodieTableMetaClient metaClient, String extraMetadataKey) {
+    HoodieTimeline cleanerTimeline = metaClient.getActiveTimeline().getCleanerTimeline().filterCompletedInstants();
+    if (cleanerTimeline.empty()) {
+      return Option.empty();
+    }
+    return Option.fromJavaOptional(
+        cleanerTimeline.getReverseOrderedInstants()
+            .map(instant -> {
+              try {
+                HoodieCleanMetadata cleanMetadata = cleanerTimeline.readCleanMetadata(instant);
+                Map<String, String> extraMetadata = cleanMetadata.getExtraMetadata();
+                if (extraMetadata != null) {
+                  String value = extraMetadata.get(extraMetadataKey);
+                  if (!StringUtils.isNullOrEmpty(value)) {
+                    return value;
+                  }
+                }
+              } catch (IOException e) {
+                throw new HoodieIOException("Failed to read clean metadata for instant " + instant.requestedTime(), e);
+              }
+              return null;
+            })
+            .filter(v -> v != null)
+            .findFirst());
   }
 
   private static Option<String> getMetadataValue(HoodieTableMetaClient metaClient, String extraMetadataKey, HoodieInstant instant) {
