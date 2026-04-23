@@ -3535,7 +3535,9 @@ public class HoodieWriteConfig extends HoodieConfig {
     }
 
     public Builder withMetaFieldsToExclude(String metaFieldsToExclude) {
-      writeConfig.setValue(HoodieTableConfig.META_FIELDS_TO_EXCLUDE, metaFieldsToExclude);
+      if (!StringUtils.isNullOrEmpty(metaFieldsToExclude)) {
+        writeConfig.setValue(HoodieTableConfig.META_FIELDS_TO_EXCLUDE, metaFieldsToExclude);
+      }
       return this;
     }
 
