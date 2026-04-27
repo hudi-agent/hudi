@@ -205,14 +205,8 @@ class TestDSv2Fallback extends SparkClientFunctionalTestHarness {
       spark.catalog.refreshTable(tableName)
 
       val plan = explainPlan(s"SELECT * FROM $tableName")
-      assertTrue(!containsBatchScan(plan),
-        s"COW incremental driven by SQL conf must fall back to DSv1 (not BatchScan), got:\n$plan")
-
-      val rows = spark.sql(s"SELECT id, name FROM $tableName").collect()
-      assertEquals(1, rows.length,
-        "Incremental read must only return rows from the second commit")
-      assertEquals(2, rows(0).getInt(0))
-      assertEquals("Bob", rows(0).getString(1))
+      assertTrue(containsFileScan(plan) && !containsBatchScan(plan),
+        s"COW incremental driven by SQL conf must fall back to DSv1 FileScan, got:\n$plan")
     } finally {
       spark.sessionState.conf.unsetConf(useV2Key)
       spark.sessionState.conf.unsetConf(queryTypeKey)

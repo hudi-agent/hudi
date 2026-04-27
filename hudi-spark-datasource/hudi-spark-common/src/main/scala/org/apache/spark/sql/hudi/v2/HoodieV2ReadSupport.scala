@@ -35,8 +35,7 @@ import org.apache.spark.sql.SparkSession
 object HoodieV2ReadSupport {
 
   def isSupportedByDSv2(metaClient: HoodieTableMetaClient,
-                        options: Map[String, String],
-                        spark: SparkSession): Boolean = {
+                        options: Map[String, String]): Boolean = {
     val tableConfig = metaClient.getTableConfig
     val queryType = SparkConfigUtils.getStringWithAltKeys(options, DataSourceReadOptions.QUERY_TYPE)
     val incrementalFormat = options.getOrElse(

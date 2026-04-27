@@ -339,6 +339,49 @@ class TestDSv2CowSnapshotRead extends SparkClientFunctionalTestHarness {
   }
 
   @Test
+  def testLargeBaseFileIsSplitForParallelism(): Unit = {
+    val path = basePath() + "/cow_split_large"
+    val _spark = spark
+    import _spark.implicits._
+
+    // Write enough rows that the resulting Parquet file is comfortably larger than the
+    // tiny maxPartitionBytes set below, guaranteeing the V2 planner emits more than
+    // one input partition for a single base file.
+    (1 to 5000).map(i => (i, s"name_$i", i * 1.5))
+      .toDF("id", "name", "amount")
+      .repartition(1)
+      .write.format("hudi")
+      .option("hoodie.table.name", "cow_split_large")
+      .option("hoodie.datasource.write.recordkey.field", "id")
+      .option("hoodie.datasource.write.precombine.field", "amount")
+      .mode(SaveMode.Overwrite)
+      .save(path)
+
+    val maxBytesKey = "spark.sql.files.maxPartitionBytes"
+    val prevMax = Option(spark.sessionState.conf.getConfString(maxBytesKey, null))
+    try {
+      spark.sessionState.conf.setConfString(maxBytesKey, "1024")
+      val df = spark.read.format("hudi_v2").load(path)
+      val numPartitions = df.rdd.getNumPartitions
+
+      val plan = df.queryExecution.executedPlan.toString()
+      assertTrue(containsBatchScan(plan), s"Expected BatchScan, plan was:\n$plan")
+      assertTrue(numPartitions > 1,
+        s"Large base file should split into multiple input partitions, got $numPartitions")
+
+      // Row set must be unchanged across split boundaries — Spark's Parquet reader
+      // assigns each row group to the split owning its midpoint, so no rows are
+      // duplicated or dropped at the boundary.
+      assertEquals(5000L, df.count())
+    } finally {
+      prevMax match {
+        case Some(v) => spark.sessionState.conf.setConfString(maxBytesKey, v)
+        case None => spark.sessionState.conf.unsetConf(maxBytesKey)
+      }
+    }
+  }
+
+  @Test
   def testDataFrameApiReadDoesNotTriggerV1Table(): Unit = {
     // Proves that a DataFrame-API read (catalogTable = None) completes end-to-end
     // through filter + projection analysis without dereferencing v1Table.

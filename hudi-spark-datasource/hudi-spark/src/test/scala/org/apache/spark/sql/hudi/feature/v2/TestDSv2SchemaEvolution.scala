@@ -25,7 +25,7 @@ import org.apache.hudi.testutils.SparkClientFunctionalTestHarness.getSparkSqlCon
 
 import org.apache.spark.SparkConf
 import org.junit.jupiter.api.{Tag, Test}
-import org.junit.jupiter.api.Assertions.{assertEquals, assertNull, assertTrue}
+import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertNull, assertTrue}
 
 /**
  * Functional tests verifying schema-evolved COW reads return correct values.
@@ -84,7 +84,7 @@ class TestDSv2SchemaEvolution extends SparkClientFunctionalTestHarness {
       val plan = explainPlan(s"SELECT * FROM $tableName")
       assertTrue(containsFileScan(plan),
         s"Schema evolution should force V1 FileScan even with use.v2=true, got:\n$plan")
-      assertTrue(!containsBatchScan(plan),
+      assertFalse(containsBatchScan(plan),
         s"Schema evolution should not produce a DSv2 BatchScan, got:\n$plan")
 
       val rows = spark.sql(s"SELECT id, name, category FROM $tableName ORDER BY id").collect()
@@ -135,7 +135,7 @@ class TestDSv2SchemaEvolution extends SparkClientFunctionalTestHarness {
       val plan = explainPlan(s"SELECT * FROM $tableName")
       assertTrue(containsFileScan(plan),
         s"Schema evolution should force V1 FileScan even with use.v2=true, got:\n$plan")
-      assertTrue(!containsBatchScan(plan),
+      assertFalse(containsBatchScan(plan),
         s"Schema evolution should not produce a DSv2 BatchScan, got:\n$plan")
 
       val rows = spark.sql(s"SELECT id, amount FROM $tableName ORDER BY id").collect()
@@ -258,7 +258,7 @@ class TestDSv2SchemaEvolution extends SparkClientFunctionalTestHarness {
       assertTrue(v2DfFields.contains("id") && v2DfFields.contains("name")
         && v2DfFields.contains("amount") && v2DfFields.contains("ts"),
         s"Time-travel schema missing original columns: ${v2Df.schema.fieldNames.mkString(",")}")
-      assertTrue(!v2DfFields.contains("region"),
+      assertFalse(v2DfFields.contains("region"),
         s"Time-travel schema must not expose post-evolution column `region`: " +
           v2Df.schema.fieldNames.mkString(","))
 

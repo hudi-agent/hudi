@@ -53,8 +53,7 @@ class HoodiePartitionReader(partition: HoodieInputPartition,
                             tableAvroSchema: HOption[HoodieSchema] = HOption.empty())
   extends PartitionReader[InternalRow] with SparkAdapterSupport {
 
-  private var rawIterator: Iterator[InternalRow] = _
-  private val iter: Iterator[InternalRow] = createIterator()
+  private val (rawIterator, iter): (Iterator[InternalRow], Iterator[InternalRow]) = createIterator()
   private var current: InternalRow = _
   private var rowCount: Int = 0
 
@@ -78,11 +77,12 @@ class HoodiePartitionReader(partition: HoodieInputPartition,
     }
   }
 
-  private def createIterator(): Iterator[InternalRow] = {
+  private def createIterator(): (Iterator[InternalRow], Iterator[InternalRow]) = {
     val partValues = InternalRow.fromSeq(partition.partitionValues.toSeq)
 
     val pFile = sparkAdapter.getSparkPartitionedFileUtils
-      .createPartitionedFile(partValues, new StoragePath(partition.baseFilePath), 0L, partition.baseFileLength)
+      .createPartitionedFile(partValues, new StoragePath(partition.baseFilePath),
+        partition.start, partition.length)
 
     val storageConf = new HadoopStorageConfiguration(broadcastConf.value.value)
     // Convert the table Avro schema into a Parquet MessageType so SparkXXParquetReader can repair
@@ -94,16 +94,17 @@ class HoodiePartitionReader(partition: HoodieInputPartition,
     } else {
       HOption.empty[MessageType]()
     }
-    rawIterator = broadcastReader.value.read(
+    val rawIter = broadcastReader.value.read(
       pFile, requiredDataSchema, requiredPartitionSchema,
       internalSchemaOpt, pushedFilters.toSeq, storageConf, tableSchemaOpt)
 
     val readerOutputSchema = StructType(requiredDataSchema.fields ++ requiredPartitionSchema.fields)
-    if (readerOutputSchema != readSchema) {
+    val projectedIter = if (readerOutputSchema != readSchema) {
       val projection = HoodieCatalystExpressionUtils.generateUnsafeProjection(readerOutputSchema, readSchema)
-      rawIterator.map(row => projection(row))
+      rawIter.map(row => projection(row))
     } else {
-      rawIterator
+      rawIter
     }
+    (rawIter, projectedIter)
   }
 }

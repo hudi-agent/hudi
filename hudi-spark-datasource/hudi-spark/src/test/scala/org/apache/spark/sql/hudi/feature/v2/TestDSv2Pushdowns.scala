@@ -143,7 +143,7 @@ class TestDSv2Pushdowns extends SparkClientFunctionalTestHarness {
 
     val plan = df.queryExecution.executedPlan.toString()
     assertTrue(containsBatchScan(plan), s"Expected BatchScan in plan:\n$plan")
-    assertTrue(!plan.contains("PushedLimit"),
+    assertFalse(plan.contains("PushedLimit"),
       s"Limit must not be pushed when a data filter remains, plan was:\n$plan")
   }
 

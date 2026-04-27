@@ -151,7 +151,7 @@ case class HoodieSparkV2Table(spark: SparkSession,
     // the same way DSv1 does.
     val explicitOpts = Map("path" -> path) ++ constructorOpts ++ tableProps ++ scanOpts
     val mergedOpts = HoodieV2ReadSupport.resolveReadOptions(spark, explicitOpts)
-    if (!HoodieV2ReadSupport.isSupportedByDSv2(metaClient, mergedOpts, spark)) {
+    if (!HoodieV2ReadSupport.isSupportedByDSv2(metaClient, mergedOpts)) {
       throw new HoodieException(
         "DSv2 read path does not support this query configuration " +
           "(MOR snapshot, non-Parquet base format, multiple base formats, " +
