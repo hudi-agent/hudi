@@ -22,7 +22,7 @@ import org.apache.hudi.client.SparkTaskContextSupplier
 import org.apache.hudi.common.bloom.{BloomFilter, BloomFilterFactory}
 import org.apache.hudi.common.config.{HoodieParquetConfig, HoodieStorageConfig}
 import org.apache.hudi.common.config.HoodieStorageConfig.{BLOOM_FILTER_DYNAMIC_MAX_ENTRIES, BLOOM_FILTER_FPP_VALUE, BLOOM_FILTER_NUM_ENTRIES_VALUE, BLOOM_FILTER_TYPE}
-import org.apache.hudi.common.model.{HoodieFileFormat, HoodieRecord}
+import org.apache.hudi.common.model.{HoodieFileFormat, HoodieMetaFieldFlags, HoodieRecord}
 import org.apache.hudi.common.schema.HoodieSchema
 import org.apache.hudi.common.util.Option
 import org.apache.hudi.io.storage.HoodieIOFactory
@@ -47,7 +47,9 @@ object SparkHelpers {
                               storage: HoodieStorage,
                               sourceFile: StoragePath,
                               destinationFile: StoragePath,
-                              keysToSkip: Set[String]) {
+                              keysToSkip: Set[String],
+                              hoodieMetaFieldFlags: HoodieMetaFieldFlags = HoodieMetaFieldFlags.allPopulated(),
+                              populateMetaFields: Boolean = true) {
     val sourceRecords = HoodieIOFactory.getIOFactory(storage)
       .getFileFormatUtils(HoodieFileFormat.PARQUET)
       .readAvroRecords(storage, sourceFile).asScala
@@ -71,7 +73,8 @@ object SparkHelpers {
     // Add current classLoad for config, if not will throw classNotFound of 'HoodieWrapperFileSystem'.
     conf.unwrap().setClassLoader(Thread.currentThread.getContextClassLoader)
 
-    val writer = new HoodieAvroParquetWriter(destinationFile, parquetConfig, instantTime, new SparkTaskContextSupplier(), true)
+    val writer = new HoodieAvroParquetWriter(destinationFile, parquetConfig, instantTime, new SparkTaskContextSupplier(),
+      populateMetaFields, hoodieMetaFieldFlags)
     for (rec <- sourceRecords) {
       val key: String = rec.get(HoodieRecord.RECORD_KEY_METADATA_FIELD).toString
       if (!keysToSkip.contains(key)) {

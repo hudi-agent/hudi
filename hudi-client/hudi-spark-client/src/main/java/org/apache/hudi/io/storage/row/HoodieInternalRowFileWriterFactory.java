@@ -109,7 +109,9 @@ public class HoodieInternalRowFileWriterFactory {
   }
 
   private static Option<BloomFilter> tryInstantiateBloomFilter(HoodieWriteConfig writeConfig) {
-    // NOTE: Currently Bloom Filter is only going to be populated if meta-fields are populated
+    // NOTE: Currently Bloom Filter is only going to be populated if meta-fields are populated.
+    // The bloom filter indexes record keys passed at write time and is independent of whether
+    // the _hoodie_record_key column is selectively excluded from storage.
     if (writeConfig.populateMetaFields()) {
       BloomFilter bloomFilter = BloomFilterFactory.createBloomFilter(
           writeConfig.getBloomFilterNumEntries(),

@@ -33,6 +33,7 @@ import org.apache.hudi.common.model.BootstrapIndexType;
 import org.apache.hudi.common.model.DefaultHoodieRecordPayload;
 import org.apache.hudi.common.model.EventTimeAvroPayload;
 import org.apache.hudi.common.model.HoodieFileFormat;
+import org.apache.hudi.common.model.HoodieMetaFieldFlags;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.model.HoodieRecordMerger;
 import org.apache.hudi.common.model.HoodieRecordPayload;
@@ -323,6 +324,17 @@ public class HoodieTableConfig extends HoodieConfig {
       .defaultValue(true)
       .withDocumentation("When enabled, populates all meta fields. When disabled, no meta fields are populated "
           + "and incremental queries will not be functional. This is only meant to be used for append only/immutable data for batch processing");
+
+  public static final ConfigProperty<String> META_FIELDS_EXCLUDE_LIST = ConfigProperty
+      .key("hoodie.table.meta.fields.exclude.list")
+      .noDefaultValue()
+      .markAdvanced()
+      .withDocumentation("Comma-separated list of Hudi meta field names to exclude from population. "
+          + "Excluded fields remain in the schema but are written as null for optimal storage savings "
+          + "(nulls take zero data bytes in Parquet, stored only as bit flags in definition levels). "
+          + "Valid values: _hoodie_commit_time, _hoodie_commit_seqno, _hoodie_record_key, "
+          + "_hoodie_partition_path, _hoodie_file_name. Only effective when "
+          + "hoodie.populate.meta.fields is true.");
 
   public static final ConfigProperty<String> KEY_GENERATOR_CLASS_NAME = ConfigProperty
       .key("hoodie.table.keygenerator.class")
@@ -1193,6 +1205,29 @@ public class HoodieTableConfig extends HoodieConfig {
    */
   public boolean populateMetaFields() {
     return Boolean.parseBoolean(getStringOrDefault(POPULATE_META_FIELDS));
+  }
+
+  /**
+   * Checks if a specific meta field is excluded from population via
+   * {@link #META_FIELDS_EXCLUDE_LIST}.
+   *
+   * @param metaFieldName the meta field name to check (e.g. {@code _hoodie_commit_time})
+   * @return true if the field is in the exclusion list
+   */
+  public boolean isMetaFieldExcluded(String metaFieldName) {
+    return HoodieMetaFieldFlags.parseExcludeList(getString(META_FIELDS_EXCLUDE_LIST))
+        .contains(metaFieldName);
+  }
+
+  /**
+   * Returns the {@link HoodieMetaFieldFlags} reflecting POPULATE_META_FIELDS and
+   * META_FIELDS_EXCLUDE_LIST as persisted on this table. This is the source of truth
+   * for both writers and readers - {@link HoodieMetaFieldFlags} should never be sourced
+   * from a writer-side config since the persisted table state is what determines on-disk
+   * meta-field availability across commits.
+   */
+  public HoodieMetaFieldFlags getHoodieMetaFieldFlags() {
+    return HoodieMetaFieldFlags.fromConfig(this);
   }
 
   /**
