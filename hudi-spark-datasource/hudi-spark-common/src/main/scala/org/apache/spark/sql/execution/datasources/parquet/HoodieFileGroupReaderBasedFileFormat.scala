@@ -24,7 +24,7 @@ import org.apache.hudi.client.utils.SparkInternalSchemaConverter
 import org.apache.hudi.common.config.{HoodieMemoryConfig, TypedProperties}
 import org.apache.hudi.common.fs.FSUtils
 import org.apache.hudi.common.model.HoodieFileFormat
-import org.apache.hudi.common.schema.HoodieSchema
+import org.apache.hudi.common.schema.{HoodieSchema, HoodieSchemaType}
 import org.apache.hudi.common.schema.HoodieSchemaUtils
 import org.apache.hudi.common.table.{HoodieTableConfig, HoodieTableMetaClient, ParquetTableSchemaResolver}
 import org.apache.hudi.common.table.read.HoodieFileGroupReader
@@ -58,6 +58,7 @@ import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnarBatchUtils}
 import org.apache.spark.util.SerializableConfiguration
+import org.lance.spark.vectorized.LanceArrowColumnVector
 
 import java.io.Closeable
 
@@ -134,6 +135,24 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
   }
 
   /**
+   * Whether the requested schema contains any top-level BLOB columns. Used to disable
+   * Lance batch mode for BLOB tables: the DESCRIPTOR-mode rewrite (and the OUT_OF_LINE
+   * data→null contract) lives only in the row-path BlobDescriptorTransform, and `supportBatch`
+   * cannot inspect read-time options (e.g. `hoodie.read.blob.inline.mode`) since it runs at
+   * planning time. Forcing row mode whenever BLOB columns are present is the simplest correct
+   * gate — BLOB processing is per-row anyway (lazy byte materialization) so the perf delta is
+   * negligible.
+   */
+  private def schemaContainsBlobColumn(schema: StructType): Boolean = {
+    schema.fields.exists { f =>
+      val md = f.metadata
+      md != null && md.contains(HoodieSchema.TYPE_METADATA_FIELD) &&
+        HoodieSchema.parseTypeDescriptor(md.getString(HoodieSchema.TYPE_METADATA_FIELD))
+          .getType == HoodieSchemaType.BLOB
+    }
+  }
+
+  /**
    * Checks if the file format supports vectorized reading, please refer to SPARK-40918.
    *
    * NOTE: for mor read, even for file-slice with only base file, we can read parquet file with vectorized read,
@@ -157,8 +176,17 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
       val orcBatchSupported = conf.orcVectorizedReaderEnabled &&
         schema.forall(s => OrcUtils.supportColumnarReads(
           s.dataType, sparkSession.sessionState.conf.orcVectorizedReaderNestedColumnEnabled))
-      // TODO: Implement columnar batch reading https://github.com/apache/hudi/issues/17736
-      val lanceBatchSupported = false
+      // Lance batch mode cannot honor either of these scenarios — they both force a runtime
+      // row path inside SparkLanceReaderBase.read:
+      //   - `hoodie.read.blob.inline.mode=DESCRIPTOR`: the BLOB rewrite lives in
+      //     BlobDescriptorTransform on the row path only.
+      //   - schema-on-read with implicit type changes: SparkSchemaTransformUtils builds the
+      //     cast projection on the row path only; the batch path has no equivalent.
+      // Disable batch at plan time whenever either trigger could fire so the planner doesn't
+      // commit to ColumnarBatch output that the row-path reader cannot deliver — Spark would
+      // wrap the scan with ColumnarToRowExec and ClassCastException on the first InternalRow.
+      val lanceBatchSupported =
+        !schemaContainsBlobColumn(schema) && !internalSchemaOpt.isPresent
 
       val supportBatch = if (isMultipleBaseFileFormatsEnabled) {
         parquetBatchSupported && orcBatchSupported
@@ -184,23 +212,43 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
   override def vectorTypes(requiredSchema: StructType,
                            partitionSchema: StructType,
                            sqlConf: SQLConf): Option[Seq[String]] = {
-    val originalVectorTypes = super.vectorTypes(requiredSchema, partitionSchema, sqlConf)
-    if (mandatoryFields.isEmpty) {
-      originalVectorTypes
-    } else {
-      val regularVectorType = if (!sqlConf.offHeapColumnVectorEnabled) {
-        classOf[OnHeapColumnVector].getName
+    if (hoodieFileFormat == HoodieFileFormat.LANCE && !isMultipleBaseFileFormatsEnabled) {
+      // Lance uses LanceArrowColumnVector for data columns and OnHeapColumnVector for partition columns.
+      // Spark uses vectorTypes to determine if columnar batch reading is supported.
+      val lanceVectorType = classOf[LanceArrowColumnVector].getName
+      val partitionVectorType = classOf[OnHeapColumnVector].getName
+      val baseTypes = Seq.fill(requiredSchema.length)(lanceVectorType) ++ Seq.fill(partitionSchema.length)(partitionVectorType)
+      if (mandatoryFields.isEmpty) {
+        Some(baseTypes)
       } else {
-        classOf[OffHeapColumnVector].getName
-      }
-      originalVectorTypes.map {
-        o: Seq[String] => o.zipWithIndex.map(a => {
-          if (a._2 >= requiredSchema.length && mandatoryFields.contains(partitionSchema.fields(a._2 - requiredSchema.length).name)) {
-            regularVectorType
+        // mandatoryFields are partition columns read from the file — use LanceArrowColumnVector for them
+        Some(baseTypes.zipWithIndex.map { case (vt, i) =>
+          if (i >= requiredSchema.length && mandatoryFields.contains(partitionSchema.fields(i - requiredSchema.length).name)) {
+            lanceVectorType
           } else {
-            a._1
+            vt
           }
         })
+      }
+    } else {
+      val originalVectorTypes = super.vectorTypes(requiredSchema, partitionSchema, sqlConf)
+      if (mandatoryFields.isEmpty) {
+        originalVectorTypes
+      } else {
+        val regularVectorType = if (!sqlConf.offHeapColumnVectorEnabled) {
+          classOf[OnHeapColumnVector].getName
+        } else {
+          classOf[OffHeapColumnVector].getName
+        }
+        originalVectorTypes.map {
+          o: Seq[String] => o.zipWithIndex.map(a => {
+            if (a._2 >= requiredSchema.length && mandatoryFields.contains(partitionSchema.fields(a._2 - requiredSchema.length).name)) {
+              regularVectorType
+            } else {
+              a._1
+            }
+          })
+        }
       }
     }
   }
@@ -220,7 +268,8 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
     // This will enable us to take advantage of spark's file splitting capability.
     // For overly large single files, we can use multiple concurrent tasks to read them, thereby reducing the overall job reading time consumption
     val superSplitable = super.isSplitable(sparkSession, options, path)
-    val splitable = !isMOR && !isIncremental && !isBootstrap && superSplitable
+    val isLance = hoodieFileFormat == HoodieFileFormat.LANCE
+    val splitable = !isMOR && !isIncremental && !isBootstrap && !isLance && superSplitable
     logInfo(s"isSplitable: $splitable, super.isSplitable: $superSplitable, isMOR: $isMOR, isIncremental: $isIncremental, isBootstrap: $isBootstrap")
     splitable
   }
@@ -251,7 +300,8 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
     partitionSchema.fields.foreach(f => exclusionFields.add(f.name))
     val requestedStructType = StructType(requiredSchema.fields ++ partitionSchema.fields.filter(f => mandatoryFields.contains(f.name)))
     val requestedSchema = HoodieSchemaUtils.pruneDataSchema(schema, HoodieSchemaConversionUtils.convertStructTypeToHoodieSchema(requestedStructType, sanitizedTableName), exclusionFields)
-    val dataSchema = HoodieSchemaUtils.pruneDataSchema(schema, HoodieSchemaConversionUtils.convertStructTypeToHoodieSchema(dataStructType, sanitizedTableName), exclusionFields)
+    val dataStructTypeWithMandatoryPartitionFields = StructType(dataStructType.fields ++ partitionSchema.fields.filter(f => mandatoryFields.contains(f.name)))
+    val dataSchema = HoodieSchemaUtils.pruneDataSchema(schema, HoodieSchemaConversionUtils.convertStructTypeToHoodieSchema(dataStructTypeWithMandatoryPartitionFields, sanitizedTableName), exclusionFields)
 
     spark.sessionState.conf.setConfString("spark.sql.parquet.enableVectorizedReader", supportVectorizedRead.toString)
 
@@ -260,6 +310,15 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
       // for file group reader to perform read, we always need to read the record without vectorized reader because our merging is based on row level.
       // TODO: please consider to support vectorized reader in file group reader
       spark.sparkContext.broadcast(buildBaseFileReader(spark, options, augmentedStorageConf.unwrap(), dataStructType, enableVectorizedRead = false))
+    } else {
+      baseFileReader
+    }
+    // For base-file-only reads (case _ branches), we use the vectorized reader for formats that support
+    // returning InternalRow even in vectorized mode (Parquet with returningBatch=false).
+    // Lance's vectorized reader always returns ColumnarBatch, so for MOR Lance tables (where
+    // supportReturningBatch=false and Spark expects InternalRow), we must use the non-vectorized reader.
+    val baseFileOnlyReader = if (isMOR && hoodieFileFormat == HoodieFileFormat.LANCE && !isMultipleBaseFileFormatsEnabled) {
+      fileGroupBaseFileReader
     } else {
       baseFileReader
     }
@@ -317,7 +376,7 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
                 fixedPartitionIndexes)
 
             case _ =>
-              readBaseFile(file, baseFileReader.value, requestedStructType, remainingPartitionSchema, fixedPartitionIndexes,
+              readBaseFile(file, baseFileOnlyReader.value, requestedStructType, remainingPartitionSchema, fixedPartitionIndexes,
                 requiredSchema, partitionSchema, outputSchema, filters ++ requiredFilters, storageConf)
           }
         // CDC queries.
@@ -325,7 +384,7 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
           buildCDCRecordIterator(hoodiePartitionCDCFileGroupSliceMapping, fileGroupBaseFileReader.value, storageConf, fileIndexProps, requiredSchema, metaClient)
 
         case _ =>
-          readBaseFile(file, baseFileReader.value, requestedStructType, remainingPartitionSchema, fixedPartitionIndexes,
+          readBaseFile(file, baseFileOnlyReader.value, requestedStructType, remainingPartitionSchema, fixedPartitionIndexes,
             requiredSchema, partitionSchema, outputSchema, filters ++ requiredFilters, storageConf)
       }
       CloseableIteratorListener.addListener(iter)
@@ -431,11 +490,28 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
 
   /**
    * Detects vector columns and replaces them with BinaryType in one step.
+   *
+   * <p>The BinaryType rewrite is Parquet-specific: Hudi stores VECTOR columns as
+   * FIXED_LEN_BYTE_ARRAY in Parquet, so the reader must see BinaryType and the raw
+   * bytes are post-converted back to ArrayType. Other formats (e.g. Lance) encode
+   * vectors natively as Arrow FixedSizeList and return ArrayType directly, so the
+   * rewrite would introduce a spurious ArrayType→BinaryType cast during schema
+   * evolution and break the read. Skip the rewrite for those formats.
+   *
    * @return (modified schema with BinaryType for vectors, vector column ordinal map)
    */
   private def withVectorRewrite(schema: StructType): (StructType, Map[Int, HoodieSchema.Vector]) = {
-    val vecs = detectVectorColumns(schema)
-    if (vecs.nonEmpty) (replaceVectorFieldsWithBinary(schema, vecs), vecs) else (schema, vecs)
+    // Only Parquet needs the BinaryType rewrite; other formats (Lance) return ArrayType natively.
+    if (hoodieFileFormat != HoodieFileFormat.PARQUET) {
+      (schema, Map.empty[Int, HoodieSchema.Vector])
+    } else {
+      val vecs = detectVectorColumns(schema)
+      if (vecs.isEmpty) {
+        (schema, vecs)
+      } else {
+        (replaceVectorFieldsWithBinary(schema, vecs), vecs)
+      }
+    }
   }
 
   /**
