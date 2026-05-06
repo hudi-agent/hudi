@@ -27,6 +27,7 @@ import org.apache.spark.sql.connector.catalog.{Identifier, Table, TableCatalog}
 import org.apache.spark.sql.execution.command.RepairTableCommand
 import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.execution.datasources.parquet.{HoodieFormatTrait, ParquetFileFormat}
+import org.apache.spark.sql.execution.streaming.SerializedOffset
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.StructType
 
@@ -107,7 +108,7 @@ object HoodieSpark34CatalystPlanUtils extends BaseHoodieCatalystPlanUtils {
 
   override def unapplyShowIndexes(plan: LogicalPlan): Option[(LogicalPlan, Seq[Attribute])] = {
     plan match {
-      case ci@ShowIndexes(table, output) =>
+      case ci@HoodieShowIndexes(table, output) =>
         Some((table, output))
       case _ =>
         None
@@ -151,6 +152,20 @@ object HoodieSpark34CatalystPlanUtils extends BaseHoodieCatalystPlanUtils {
         Some(ResolveInsertionBase.createProjectForByNameQuery(lr.catalogTable.get.qualifiedName, insert))
       case _ =>
         None
+    }
+  }
+
+  override def unapplyUpdateAction(mergeAction: Any): Option[(Option[Expression], Seq[Assignment])] = {
+    mergeAction match {
+      case UpdateAction(condition, assignments) => Some((condition, assignments))
+      case _ => None
+    }
+  }
+
+  override def extractJsonFromSerializedOffset(offset: Any): Option[String] = {
+    offset match {
+      case SerializedOffset(json) => Some(json)
+      case _ => None
     }
   }
 }
