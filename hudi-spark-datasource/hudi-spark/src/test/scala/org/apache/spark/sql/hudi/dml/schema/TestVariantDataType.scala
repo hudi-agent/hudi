@@ -20,14 +20,32 @@
 package org.apache.spark.sql.hudi.dml.schema
 
 import org.apache.hudi.HoodieSparkUtils
+import org.apache.hudi.common.schema.HoodieSchema
 import org.apache.hudi.common.testutils.HoodieTestUtils
 import org.apache.hudi.common.util.StringUtils
 import org.apache.hudi.internal.schema.HoodieSchemaException
+import org.apache.hudi.testutils.DataSourceTestUtils
+import org.apache.hudi.testutils.HoodieClientTestUtils.createMetaClient
 
+import org.apache.spark.sql.{Row, SaveMode}
+import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.catalyst.catalog.{CatalogStorageFormat, CatalogTable, CatalogTableType}
+import org.apache.spark.sql.hudi.command.CreateHoodieTableCommand
 import org.apache.spark.sql.hudi.common.HoodieSparkSqlTestBase
+import org.apache.spark.sql.types.{ArrayType, BinaryType, DataType, LongType, MapType, MetadataBuilder, StringType, StructField, StructType}
+import org.scalatest.{Canceled, Outcome}
 
 
 class TestVariantDataType extends HoodieSparkSqlTestBase {
+
+  // TODO(#18605): Re-enable after fixing JVM SIGSEGV crash on Spark 4.1
+  override def withFixture(test: NoArgTest): Outcome = {
+    if (HoodieSparkUtils.gteqSpark4_1) {
+      Canceled("Disabled on Spark 4.1 due to JVM SIGSEGV crash in variant data type tests")
+    } else {
+      super.withFixture(test)
+    }
+  }
 
   test(s"Test Table with Variant Data Type") {
     // Variant type is only supported in Spark 4.0+
@@ -87,7 +105,350 @@ class TestVariantDataType extends HoodieSparkSqlTestBase {
         checkAnswer(s"select id, name, cast(v as string), ts from $tableName order by id")(
           Seq(1, "row1", "{\"new_field\":123,\"updated\":true}", 1000)
         )
+
+        // Test MergeInto: exercises both MATCHED (UPDATE SET on the Variant
+        // column) and NOT MATCHED (INSERT of a new row carrying a Variant
+        // literal).
+        spark.sql(
+          s"""
+             |merge into $tableName t
+             |using (
+             |  select 1 as id, 'row1' as name, parse_json('{"key":"v1-merged"}') as v, 2000L as ts
+             |  union all
+             |  select 3 as id, 'row3' as name, parse_json('{"key":"v3"}') as v, 2000L as ts
+             |) s
+             |on t.id = s.id
+             |when matched then update set t.v = s.v, t.ts = s.ts
+             |when not matched then insert (id, name, v, ts) values (s.id, s.name, s.v, s.ts)
+             """.stripMargin)
+
+        checkAnswer(s"select id, name, cast(v as string), ts from $tableName order by id")(
+          Seq(1, "row1", "{\"key\":\"v1-merged\"}", 2000),
+          Seq(3, "row3", "{\"key\":\"v3\"}", 2000)
+        )
       })
+    }
+  }
+
+  test("Test Query Log Only MOR Table With VARIANT column triggers compaction") {
+    assume(HoodieSparkUtils.gteqSpark4_0, "Variant type requires Spark 4.0 or higher")
+
+    withRecordType()(withTempDir { tmp =>
+      val tableName = generateTableName
+      spark.sql(
+        s"""
+           |create table $tableName (
+           |  id int,
+           |  v variant,
+           |  ts long
+           |) using hudi
+           | location '${tmp.getCanonicalPath}'
+           | tblproperties (
+           |  primaryKey = 'id',
+           |  type = 'mor',
+           |  preCombineField = 'ts',
+           |  hoodie.index.type = 'INMEMORY',
+           |  hoodie.compact.inline = 'true',
+           |  hoodie.clean.commits.retained = '1'
+           | )
+       """.stripMargin)
+
+      spark.sql(
+        s"insert into $tableName values " +
+          "(1, parse_json('{\"key\":\"value1\"}'), 1000)")
+      spark.sql(
+        s"insert into $tableName values " +
+          "(2, parse_json('{\"key\":\"value2\"}'), 1000)")
+      spark.sql(
+        s"insert into $tableName values " +
+          "(3, parse_json('{\"key\":\"value3\"}'), 1000)")
+      // 3 commits will not trigger compaction, so it should be log only.
+      assertResult(true)(DataSourceTestUtils.isLogFileOnly(tmp.getCanonicalPath))
+      checkAnswer(s"select id, cast(v as string), ts from $tableName order by id")(
+        Seq(1, "{\"key\":\"value1\"}", 1000),
+        Seq(2, "{\"key\":\"value2\"}", 1000),
+        Seq(3, "{\"key\":\"value3\"}", 1000)
+      )
+
+      spark.sql(
+        s"""
+           |merge into $tableName h0
+           |using (
+           |  select 1 as id,
+           |         parse_json('{"key":"v1-merged"}') as v,
+           |         1001L as ts
+           |) s0
+           | on h0.id = s0.id
+           | when matched then update set *
+           |""".stripMargin)
+      // 4 commits will not trigger compaction, so it should be log only.
+      assertResult(true)(DataSourceTestUtils.isLogFileOnly(tmp.getCanonicalPath))
+      checkAnswer(s"select id, cast(v as string), ts from $tableName order by id")(
+        Seq(1, "{\"key\":\"v1-merged\"}", 1001),
+        Seq(2, "{\"key\":\"value2\"}", 1000),
+        Seq(3, "{\"key\":\"value3\"}", 1000)
+      )
+
+      spark.sql(
+        s"""
+           |merge into $tableName h0
+           |using (
+           |  select 4 as id,
+           |         parse_json('{"key":"value4"}') as v,
+           |         1000L as ts
+           |) s0
+           | on h0.id = s0.id
+           | when not matched then insert *
+           |""".stripMargin)
+
+      // 5 commits will trigger compaction.
+      assertResult(false)(DataSourceTestUtils.isLogFileOnly(tmp.getCanonicalPath))
+      checkAnswer(s"select id, cast(v as string), ts from $tableName order by id")(
+        Seq(1, "{\"key\":\"v1-merged\"}", 1001),
+        Seq(2, "{\"key\":\"value2\"}", 1000),
+        Seq(3, "{\"key\":\"value3\"}", 1000),
+        Seq(4, "{\"key\":\"value4\"}", 1000)
+      )
+
+      // VARIANT must round-trip as native VariantType through the compacted base-file read path.
+      val variantField = spark.table(tableName).schema.find(_.name == "v").get
+      assertResult("variant")(variantField.dataType.typeName)
+
+      // 6th commit drives an auto-clean that retires the now-superseded log-only slice.
+      // Inline compaction on commit 5 ran AFTER its own postCommit clean, so the prior
+      // slice was not yet superseded when that clean fired and no .clean instant was
+      // written. This deltacommit's postCommit clean writes the .clean instant.
+      spark.sql(
+        s"""
+           |merge into $tableName h0
+           |using (
+           |  select 2 as id,
+           |         parse_json('{"key":"v2-merged"}') as v,
+           |         1002L as ts
+           |) s0
+           | on h0.id = s0.id
+           | when matched then update set *
+           |""".stripMargin)
+      checkAnswer(s"select id, cast(v as string), ts from $tableName order by id")(
+        Seq(1, "{\"key\":\"v1-merged\"}", 1001),
+        Seq(2, "{\"key\":\"v2-merged\"}", 1002),
+        Seq(3, "{\"key\":\"value3\"}", 1000),
+        Seq(4, "{\"key\":\"value4\"}", 1000)
+      )
+
+      val metaClient = createMetaClient(spark, tmp.getCanonicalPath)
+      metaClient.reloadActiveTimeline()
+      assert(metaClient.getActiveTimeline.getCleanerTimeline.countInstants() > 0,
+        "Expected at least one .clean instant on the timeline after compaction")
+    })
+  }
+
+  test("Test toHiveCompatibleSchema converts VariantType to physical struct") {
+    assume(HoodieSparkUtils.gteqSpark4_0, "Variant type requires Spark 4.0 or higher")
+
+    val variantType = DataType.fromDDL("variant")
+    val schema = StructType(Seq(
+      StructField("id", LongType, nullable = false),
+      StructField("name", StringType),
+      StructField("variant_col", variantType, nullable = true),
+      StructField("nested_struct", StructType(Seq(
+        StructField("inner_variant", variantType)
+      ))),
+      StructField("variant_array", ArrayType(variantType)),
+      StructField("variant_map", MapType(StringType, variantType)),
+      StructField("ts", LongType)
+    ))
+
+    val hiveSchema = CreateHoodieTableCommand.toHiveCompatibleSchema(schema)
+
+    // Non-variant fields should be unchanged
+    assert(hiveSchema("id").dataType == LongType)
+    assert(hiveSchema("name").dataType == StringType)
+    assert(hiveSchema("ts").dataType == LongType)
+
+    // Top-level variant should be converted with canonical (metadata, value) field order.
+    val variantStruct = assertVariantStruct(hiveSchema("variant_col").dataType)
+    assert(variantStruct.fields(0).name == HoodieSchema.Variant.VARIANT_METADATA_FIELD)
+    assert(variantStruct.fields(1).name == HoodieSchema.Variant.VARIANT_VALUE_FIELD)
+
+    // Variant nested inside a StructType should be converted recursively.
+    val nestedStruct = hiveSchema("nested_struct").dataType.asInstanceOf[StructType]
+    assertVariantStruct(nestedStruct("inner_variant").dataType)
+
+    // Variant as ArrayType element should be converted.
+    val arrayType = hiveSchema("variant_array").dataType.asInstanceOf[ArrayType]
+    assertVariantStruct(arrayType.elementType)
+
+    // Variant as MapType value should be converted.
+    val mapType = hiveSchema("variant_map").dataType.asInstanceOf[MapType]
+    assert(mapType.keyType == StringType)
+    assertVariantStruct(mapType.valueType)
+  }
+
+  private def assertVariantStruct(dataType: DataType): StructType = {
+    assert(dataType.isInstanceOf[StructType])
+    val structType = dataType.asInstanceOf[StructType]
+    assert(structType.length == 2)
+    assert(structType(HoodieSchema.Variant.VARIANT_METADATA_FIELD).dataType == BinaryType)
+    assert(structType(HoodieSchema.Variant.VARIANT_VALUE_FIELD).dataType == BinaryType)
+    structType
+  }
+
+  test("Test buildHiveCompatibleCatalogTable converts schema and merges properties") {
+    assume(HoodieSparkUtils.gteqSpark4_0, "Variant type requires Spark 4.0 or higher")
+
+    val variantType = DataType.fromDDL("variant")
+    val table = CatalogTable(
+      identifier = TableIdentifier("test_table", Some("default")),
+      tableType = CatalogTableType.MANAGED,
+      storage = CatalogStorageFormat.empty,
+      schema = StructType(Seq(
+        StructField("id", LongType, nullable = false),
+        StructField("variant_col", variantType, nullable = true)
+      )),
+      provider = Some("hudi"),
+      properties = Map("existing_key" -> "table_value", "shared_key" -> "table_value"))
+
+    val dataSourceProps = Map(
+      "spark.sql.sources.provider" -> "hudi",
+      "shared_key" -> "datasource_value")
+
+    val result = CreateHoodieTableCommand.buildHiveCompatibleCatalogTable(table, dataSourceProps)
+
+    // VariantType replaced with the canonical (metadata, value) struct.
+    assertVariantStruct(result.schema("variant_col").dataType)
+    // Non-variant columns preserved.
+    assert(result.schema("id").dataType == LongType)
+    // Existing-only table properties survive.
+    assert(result.properties("existing_key") == "table_value")
+    // dataSource-only keys are merged in.
+    assert(result.properties("spark.sql.sources.provider") == "hudi")
+    // On conflict, CatalogTable.properties wins over dataSourceProps (right-biased `++`).
+    assert(result.properties("shared_key") == "table_value")
+    // Identity/provider fields pass through unchanged.
+    assert(result.identifier == table.identifier)
+    assert(result.provider == table.provider)
+  }
+
+  test("Test DataFrame writer with native VariantType round-trips through the V1 save path") {
+    assume(HoodieSparkUtils.gteqSpark4_0, "Variant type requires Spark 4.0 or higher")
+
+    withTempDir { tmp =>
+      val df = spark.sql(
+        """
+          |SELECT
+          |  1L AS id,
+          |  'row1' AS name,
+          |  parse_json('{"key":"value1"}') AS variant_data,
+          |  1000L AS ts
+          |UNION ALL
+          |SELECT
+          |  2L AS id,
+          |  'row2' AS name,
+          |  parse_json('{"key":"value2"}') AS variant_data,
+          |  1000L AS ts
+          |""".stripMargin)
+
+      // Sanity: the DataFrame carries a native VariantType column, not a metadata-tagged struct.
+      assert(df.schema("variant_data").dataType.typeName == "variant",
+        s"expected native VariantType, got ${df.schema("variant_data").dataType}")
+
+      df.write.format("hudi")
+        .option("hoodie.table.name", "variant_native_df_test")
+        .option("hoodie.datasource.write.recordkey.field", "id")
+        .option("hoodie.datasource.write.precombine.field", "ts")
+        .mode(SaveMode.Overwrite)
+        .save(tmp.getCanonicalPath)
+
+      val readDf = spark.read.format("hudi").load(tmp.getCanonicalPath)
+      assert(readDf.schema("variant_data").dataType.typeName == "variant",
+        s"variant_data should round-trip as native VariantType, got ${readDf.schema("variant_data").dataType}")
+      assert(readDf.count() == 2)
+
+      val rows = readDf.selectExpr("id", "cast(variant_data as string) as v")
+        .orderBy("id").collect()
+      assert(rows(0).getString(1) == "{\"key\":\"value1\"}")
+      assert(rows(1).getString(1) == "{\"key\":\"value2\"}")
+    }
+  }
+
+  test("Test StructType with hudi_type=VARIANT metadata is promoted to VARIANT logical type") {
+    // A StructType field in the DataFrame API tagged with hudi_type=VARIANT is treated as a first-class
+    // VARIANT (like BLOB/VECTOR), not a plain struct. On Spark 4.0+ the column round-trips as native VariantType.
+    assume(HoodieSparkUtils.gteqSpark4_0, "Variant type requires Spark 4.0 or higher")
+
+    withTempDir { tmp =>
+      val variantMetadata = new MetadataBuilder()
+        .putString(HoodieSchema.TYPE_METADATA_FIELD, "VARIANT")
+        .build()
+
+      val variantStruct = StructType(Seq(
+        StructField("metadata", BinaryType, nullable = false),
+        StructField("value", BinaryType, nullable = false)
+      ))
+
+      val schema = StructType(Seq(
+        StructField("id", LongType, nullable = false),
+        StructField("name", StringType),
+        StructField("variant_data", variantStruct, nullable = false, metadata = variantMetadata),
+        StructField("ts", LongType)
+      ))
+
+      val data = Seq(
+        Row(1L, "row1", Row(Array[Byte](1, 0), """{"key":"value1"}""".getBytes), 1000L)
+      )
+      val df = spark.createDataFrame(spark.sparkContext.parallelize(data), schema)
+
+      df.write.format("hudi")
+        .option("hoodie.table.name", "variant_struct_test")
+        .option("hoodie.datasource.write.recordkey.field", "id")
+        .option("hoodie.datasource.write.precombine.field", "ts")
+        .mode(SaveMode.Overwrite)
+        .save(tmp.getCanonicalPath)
+
+      val readDf = spark.read.format("hudi").load(tmp.getCanonicalPath)
+      val readFieldType = readDf.schema("variant_data").dataType
+      assert(readFieldType.typeName == "variant",
+        s"variant_data should round-trip as native VariantType on Spark 4.0+, got $readFieldType")
+      assert(readDf.count() == 1)
+    }
+  }
+
+  test("Test StructType with hudi_type=VARIANT metadata rejects malformed struct") {
+    assume(HoodieSparkUtils.gteqSpark4_0, "Variant type requires Spark 4.0 or higher")
+
+    withTempDir { tmp =>
+      val variantMetadata = new MetadataBuilder()
+        .putString(HoodieSchema.TYPE_METADATA_FIELD, "VARIANT")
+        .build()
+
+      // VARIANT structure must be {metadata: binary, value: binary}; a single string field is malformed.
+      val malformedVariantStruct = StructType(Seq(
+        StructField("wrong_field", StringType, nullable = false)
+      ))
+
+      val schema = StructType(Seq(
+        StructField("id", LongType, nullable = false),
+        StructField("variant_data", malformedVariantStruct, nullable = false, metadata = variantMetadata),
+        StructField("ts", LongType)
+      ))
+
+      val data = Seq(Row(1L, Row("oops"), 1000L))
+      val df = spark.createDataFrame(spark.sparkContext.parallelize(data), schema)
+
+      val ex = intercept[Exception] {
+        df.write.format("hudi")
+          .option("hoodie.table.name", "variant_malformed_test")
+          .option("hoodie.datasource.write.recordkey.field", "id")
+          .option("hoodie.datasource.write.precombine.field", "ts")
+          .mode(SaveMode.Overwrite)
+          .save(tmp.getCanonicalPath)
+      }
+      val causes = Iterator.iterate[Throwable](ex)(e => e.getCause).takeWhile(_ != null).toList
+      assert(causes.exists(c => c.isInstanceOf[IllegalArgumentException]
+        && c.getMessage != null
+        && c.getMessage.contains("Invalid variant schema structure")),
+        s"Expected IllegalArgumentException with 'Invalid variant schema structure', got: ${causes.map(_.getMessage)}")
     }
   }
 
