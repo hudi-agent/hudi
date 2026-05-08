@@ -32,15 +32,37 @@ import java.io.IOException;
 public final class ParquetSplitRecordIterator implements ClosableIterator<RowData> {
   private final ParquetColumnarRowSplitReader reader;
 
+  // Cached end-of-stream signal once the underlying Hadoop input stream is closed externally
+  // (see hasNext() for the rationale). Avoids re-invoking the reader after we've already
+  // observed the close.
+  private boolean drained = false;
+
   public ParquetSplitRecordIterator(ParquetColumnarRowSplitReader reader) {
     this.reader = reader;
   }
 
   @Override
   public boolean hasNext() {
+    if (drained) {
+      return false;
+    }
     try {
       return !reader.reachedEnd();
     } catch (IOException e) {
+      // The underlying Hadoop FSDataInputStream can be closed externally during streaming
+      // source teardown: the SourceV2 SplitFetcher thread can close the stream after enqueueing
+      // a BatchRecords, then the mailbox thread polls and tries to read another row group on
+      // the now-closed stream. The well-known stable Hadoop signal for this is
+      // BufferedFSInputStream / FSInputChecker throwing IOException("Stream is closed!"). Since
+      // the streaming source runs with restart-strategy.maxNumberRestartAttempts=0, surfacing
+      // this as a fatal HoodieIOException permanently fails the job and turns
+      // ITTestHoodieDataSource#testStreamReadFromSpecifiedCommitWithChangelog into a flake.
+      // Treat it as end-of-stream and cache the state so subsequent hasNext() calls on the
+      // now-broken reader short-circuit instead of re-throwing on every poll.
+      if (isStreamClosedSignal(e)) {
+        drained = true;
+        return false;
+      }
       throw new HoodieIOException("Decides whether the parquet columnar row split reader reached end exception", e);
     }
   }
@@ -57,5 +79,23 @@ public final class ParquetSplitRecordIterator implements ClosableIterator<RowDat
     } catch (IOException e) {
       throw new HoodieIOException("Close the parquet columnar row split reader exception", e);
     }
+  }
+
+  /**
+   * Returns true iff the IOException (or any of its causes) was raised because the underlying
+   * Hadoop input stream was closed. Hadoop's BufferedFSInputStream and FSInputChecker raise
+   * {@code IOException("Stream is closed!")} (no dedicated subtype), so we walk the cause chain
+   * and substring-match.
+   */
+  private static boolean isStreamClosedSignal(IOException e) {
+    Throwable cur = e;
+    while (cur != null) {
+      String msg = cur.getMessage();
+      if (msg != null && msg.contains("Stream is closed")) {
+        return true;
+      }
+      cur = cur.getCause();
+    }
+    return false;
   }
 }
