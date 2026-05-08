@@ -24,6 +24,7 @@ import org.apache.hudi.common.model.FileSlice
 import org.apache.hudi.common.schema.HoodieSchema
 import org.apache.hudi.common.table.HoodieTableMetaClient
 import org.apache.hudi.common.table.cdc.HoodieCDCFileSplit
+import org.apache.hudi.io.storage.VariantProjectedRow
 import org.apache.hudi.storage.StorageConfiguration
 
 import org.apache.hadoop.conf.Configuration
@@ -35,7 +36,7 @@ import org.apache.spark.sql._
 import org.apache.spark.sql.avro.{HoodieAvroDeserializer, HoodieAvroSerializer}
 import org.apache.spark.sql.catalyst.{InternalRow, TableIdentifier}
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
-import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Expression, InterpretedPredicate, SpecializedGetters}
+import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Expression, GenericInternalRow, InterpretedPredicate, SpecializedGetters}
 import org.apache.spark.sql.catalyst.parser.{ParseException, ParserInterface}
 import org.apache.spark.sql.catalyst.plans.logical.{Command, LogicalPlan}
 import org.apache.spark.sql.catalyst.trees.Origin
@@ -75,6 +76,17 @@ trait SparkAdapter extends Serializable {
    * Inject table-valued functions to SparkSessionExtensions
    */
   def injectTableFunctions(extensions: SparkSessionExtensions): Unit = {}
+
+  /**
+   * Inject scalar functions into Spark SQL function registry.
+   * These functions can be used in SQL SELECT clauses.
+   */
+  def injectScalarFunctions(extensions: SparkSessionExtensions): Unit
+
+  /**
+   * Inject planner strategies to SparkSessionExtensions for converting custom logical plans into physical plans.
+   */
+  def injectPlannerStrategies(extensions: SparkSessionExtensions): Unit
 
   /**
    * Returns an instance of [[HoodieCatalystExpressionUtils]] providing for common utils operating
@@ -427,6 +439,29 @@ trait SparkAdapter extends Serializable {
   ): BiConsumer[SpecializedGetters, Integer]
 
   /**
+   * Creates a [[VariantProjectedRow]] for the Lance writer's variant projection.
+   * Spark 3.x throws (no VariantType support); Spark 4.x returns a row that delegates
+   * accessors to the wrapped input row, except at the configured variant ordinals where
+   * it returns the pre-allocated {@code (metadata, value)} struct populated by the
+   * matching extractor.
+   *
+   * Kept on the adapter so the shared {@code hudi-spark-client} module never needs to
+   * reference Spark-4-only types like {@code VariantVal} / {@code InternalRow.getVariant}.
+   *
+   * @param numFields                total number of top-level fields in the projection
+   * @param variantStructByOrdinal   non-null only at variant ordinals; pre-allocated
+   *                                 {@code GenericInternalRow(new Object[2])}
+   * @param extractorByOrdinal       non-null only at variant ordinals; populates the
+   *                                 corresponding entry in {@code variantStructByOrdinal}
+   * @return a stateful [[VariantProjectedRow]] (Spark 4 only)
+   */
+  def createVariantProjectedRow(
+    numFields: Int,
+    variantStructByOrdinal: Array[GenericInternalRow],
+    extractorByOrdinal: java.util.List[BiConsumer[SpecializedGetters, java.lang.Integer]]
+  ): VariantProjectedRow
+
+  /**
    * Converts a VariantType field to Parquet Type.
    * Returns null for Spark 3.x or if the data type is not VariantType.
    *
@@ -483,4 +518,32 @@ trait SparkAdapter extends Serializable {
     shreddedStructType: StructType,
     writeStruct: Consumer[InternalRow]
   ): BiConsumer[SpecializedGetters, Integer]
+
+  /**
+   * Creates a [[HoodieMemoryStream]] wrapper around Spark's MemoryStream.
+   * This abstracts the package differences between Spark versions:
+   * - Spark 3.x/4.0: org.apache.spark.sql.execution.streaming.MemoryStream
+   * - Spark 4.1+: org.apache.spark.sql.execution.streaming.runtime.MemoryStream
+   *
+   * @param id           ID for the MemoryStream
+   * @param sparkSession [[SparkSession]] object
+   * @param encoder      Implicit encoder for type T
+   * @return A [[HoodieMemoryStream]] wrapper
+   */
+  def createMemoryStream[T: Encoder](id: Int, sparkSession: SparkSession): HoodieMemoryStream[T]
+}
+
+/**
+ * Wrapper trait for Spark's MemoryStream to abstract package differences across Spark versions.
+ */
+trait HoodieMemoryStream[T] {
+  /**
+   * Add data to the stream.
+   */
+  def addData(data: TraversableOnce[T]): Unit
+
+  /**
+   * Convert the stream to a Dataset.
+   */
+  def toDS(): Dataset[T]
 }

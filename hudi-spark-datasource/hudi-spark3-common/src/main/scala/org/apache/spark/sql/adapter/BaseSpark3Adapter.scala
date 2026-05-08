@@ -24,6 +24,7 @@ import org.apache.hudi.common.schema.HoodieSchema
 import org.apache.hudi.common.table.HoodieTableMetaClient
 import org.apache.hudi.common.table.cdc.HoodieCDCFileSplit
 import org.apache.hudi.common.util.JsonUtils
+import org.apache.hudi.io.storage.VariantProjectedRow
 import org.apache.hudi.spark.internal.ReflectUtil
 
 import org.apache.parquet.schema.Type
@@ -31,12 +32,12 @@ import org.apache.parquet.schema.Type.Repetition
 import org.apache.spark.api.java.JavaSparkContext
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{AnalysisException, Column, DataFrame, DataFrameUtil, Dataset, HoodieUnsafeUtils, HoodieUTF8StringFactory, Spark3DataFrameUtil, Spark3HoodieUnsafeUtils, Spark3HoodieUTF8StringFactory, SparkSession, SQLContext}
+import org.apache.spark.sql.{AnalysisException, Column, DataFrame, DataFrameUtil, Dataset, Encoder, HoodieUnsafeUtils, HoodieUTF8StringFactory, Spark3DataFrameUtil, Spark3HoodieUnsafeUtils, Spark3HoodieUTF8StringFactory, SparkSession, SQLContext}
 import org.apache.spark.sql.FileFormatUtilsForFileGroupReader.applyFiltersToPlan
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.EliminateSubqueryAliases
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
-import org.apache.spark.sql.catalyst.expressions.{Expression, InterpretedPredicate, Predicate, SpecializedGetters}
+import org.apache.spark.sql.catalyst.expressions.{Expression, GenericInternalRow, InterpretedPredicate, Predicate, SpecializedGetters}
 import org.apache.spark.sql.catalyst.parser.ParseException
 import org.apache.spark.sql.catalyst.planning.PhysicalOperation
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
@@ -45,7 +46,8 @@ import org.apache.spark.sql.catalyst.util.DateFormatter
 import org.apache.spark.sql.execution.{PartitionedFileUtil, QueryExecution, SQLExecution}
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.execution.datasources.parquet.HoodieFormatTrait
-import org.apache.spark.sql.hudi.SparkAdapter
+import org.apache.spark.sql.execution.streaming.MemoryStream
+import org.apache.spark.sql.hudi.{HoodieMemoryStream, SparkAdapter}
 import org.apache.spark.sql.sources.{BaseRelation, Filter}
 import org.apache.spark.sql.types.{DataType, StructType}
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
@@ -203,6 +205,14 @@ abstract class BaseSpark3Adapter extends SparkAdapter with Logging {
     throw new UnsupportedOperationException("Spark 3.x does not support VariantType")
   }
 
+  override def createVariantProjectedRow(
+    numFields: Int,
+    variantStructByOrdinal: Array[GenericInternalRow],
+    extractorByOrdinal: java.util.List[BiConsumer[SpecializedGetters, java.lang.Integer]]
+  ): VariantProjectedRow = {
+    throw new UnsupportedOperationException("Spark 3.x does not support VariantType")
+  }
+
   override def convertVariantFieldToParquetType(
     dataType: DataType,
     fieldName: String,
@@ -225,5 +235,13 @@ abstract class BaseSpark3Adapter extends SparkAdapter with Logging {
     writeStruct: Consumer[InternalRow]
   ): BiConsumer[SpecializedGetters, Integer] = {
     throw new UnsupportedOperationException("Spark 3.x does not support Variant shredding")
+  }
+
+  override def createMemoryStream[T: Encoder](id: Int, sparkSession: SparkSession): HoodieMemoryStream[T] = {
+    val memoryStream = new MemoryStream[T](id, sparkSession.sqlContext)
+    new HoodieMemoryStream[T] {
+      override def addData(data: TraversableOnce[T]): Unit = memoryStream.addData(data)
+      override def toDS(): Dataset[T] = memoryStream.toDS()
+    }
   }
 }
