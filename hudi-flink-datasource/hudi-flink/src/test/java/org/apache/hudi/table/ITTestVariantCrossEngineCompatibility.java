@@ -18,9 +18,9 @@
 
 package org.apache.hudi.table;
 
+import org.apache.hudi.adapter.DataTypeAdapter;
 import org.apache.hudi.common.testutils.HoodieTestUtils;
 import org.apache.hudi.common.util.StringUtils;
-import org.apache.hudi.util.HoodieSchemaConverter;
 import org.apache.hudi.utils.FlinkMiniCluster;
 import org.apache.hudi.utils.TestTableEnvs;
 
@@ -84,7 +84,15 @@ public class ITTestVariantCrossEngineCompatibility {
     TableEnvironment tableEnv = TestTableEnvs.getBatchTableEnv();
     tableEnv.executeSql(createVariantTableDdl(tablePath, tableType));
 
-    if (HoodieSchemaConverter.tryCreateVariantDataType() == null) {
+    boolean variantSupported;
+    try {
+      DataTypeAdapter.createVariantType();
+      variantSupported = true;
+    } catch (UnsupportedOperationException e) {
+      variantSupported = false;
+    }
+
+    if (!variantSupported) {
       assertThrows(
           Exception.class,
           () -> {
