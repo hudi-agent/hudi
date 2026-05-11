@@ -692,27 +692,30 @@ public class TestHoodieSchemaConverter {
     assertEquals(HoodieSchemaType.BLOB, convertedMap.getValueType().getType());
   }
 
+  private static boolean hasNativeVariantType() {
+    return HoodieSchemaConverter.tryCreateVariantDataType() != null;
+  }
+
   @Test
   @Disabled("disabled and reopen the tests for 1.3")
   public void testVariantTypeConversion() {
-    // Test direct Variant conversion
     HoodieSchema variantSchema = HoodieSchema.createVariant();
-    DataType dataType = HoodieSchemaConverter.convertToDataType(variantSchema);
-    assertNotNull(dataType);
 
-    // Verify it's a ROW with metadata and value binary fields
-    RowType rowType = (RowType) dataType.getLogicalType();
-    assertEquals(2, rowType.getFieldCount());
-    assertEquals("metadata", rowType.getFieldNames().get(0));
-    assertEquals("value", rowType.getFieldNames().get(1));
-    assertInstanceOf(VarBinaryType.class, rowType.getTypeAt(0));
-    assertInstanceOf(VarBinaryType.class, rowType.getTypeAt(1));
+    if (hasNativeVariantType()) {
+      DataType dataType = HoodieSchemaConverter.convertToDataType(variantSchema);
+      assertNotNull(dataType);
+      assertEquals("VARIANT", dataType.getLogicalType().getTypeRoot().name());
+    } else {
+      UnsupportedOperationException ex = assertThrows(
+          UnsupportedOperationException.class,
+          () -> HoodieSchemaConverter.convertToDataType(variantSchema));
+      assertTrue(ex.getMessage().contains("VARIANT type is only supported in Flink 2.1+"));
+    }
   }
 
   @Test
   @Disabled("disabled and reopen the tests for 1.3")
   public void testVariantInRecordConversion() {
-    // Test Variant field within a record
     HoodieSchema recordWithVariant = HoodieSchema.createRecord(
         "test_record",
         null,
@@ -723,15 +726,63 @@ public class TestHoodieSchemaConverter {
         )
     );
 
-    RowType result = HoodieSchemaConverter.convertToRowType(recordWithVariant);
-    assertEquals(2, result.getFieldCount());
-    assertEquals("data", result.getFieldNames().get(1));
+    if (hasNativeVariantType()) {
+      RowType result = HoodieSchemaConverter.convertToRowType(recordWithVariant);
+      assertEquals(2, result.getFieldCount());
+      assertEquals("data", result.getFieldNames().get(1));
+      assertEquals("VARIANT", result.getTypeAt(1).getTypeRoot().name());
+    } else {
+      UnsupportedOperationException ex = assertThrows(
+          UnsupportedOperationException.class,
+          () -> HoodieSchemaConverter.convertToRowType(recordWithVariant));
+      assertTrue(ex.getMessage().contains("VARIANT type is only supported in Flink 2.1+"));
+    }
+  }
 
-    // Verify variant field is a ROW<metadata BYTES, value BYTES>
-    RowType variantRowType = (RowType) result.getTypeAt(1);
-    assertEquals(2, variantRowType.getFieldCount());
-    assertEquals("metadata", variantRowType.getFieldNames().get(0));
-    assertEquals("value", variantRowType.getFieldNames().get(1));
+  @Test
+  public void testVariantInArrayConversion() {
+    HoodieSchema arrayOfVariant = HoodieSchema.createArray(HoodieSchema.createVariant());
+
+    if (hasNativeVariantType()) {
+      DataType dataType = HoodieSchemaConverter.convertToDataType(arrayOfVariant);
+      assertNotNull(dataType);
+      assertInstanceOf(ArrayType.class, dataType.getLogicalType());
+      LogicalType elementType = ((ArrayType) dataType.getLogicalType()).getElementType();
+      assertEquals("VARIANT", elementType.getTypeRoot().name());
+    } else {
+      UnsupportedOperationException ex = assertThrows(
+          UnsupportedOperationException.class,
+          () -> HoodieSchemaConverter.convertToDataType(arrayOfVariant));
+      assertTrue(ex.getMessage().contains("VARIANT type is only supported in Flink 2.1+"));
+    }
+  }
+
+  @Test
+  public void testVariantInMapConversion() {
+    HoodieSchema mapOfVariant = HoodieSchema.createMap(HoodieSchema.createVariant());
+
+    if (hasNativeVariantType()) {
+      DataType dataType = HoodieSchemaConverter.convertToDataType(mapOfVariant);
+      assertNotNull(dataType);
+      assertInstanceOf(MapType.class, dataType.getLogicalType());
+      LogicalType valueType = ((MapType) dataType.getLogicalType()).getValueType();
+      assertEquals("VARIANT", valueType.getTypeRoot().name());
+    } else {
+      UnsupportedOperationException ex = assertThrows(
+          UnsupportedOperationException.class,
+          () -> HoodieSchemaConverter.convertToDataType(mapOfVariant));
+      assertTrue(ex.getMessage().contains("VARIANT type is only supported in Flink 2.1+"));
+    }
+  }
+
+  @Test
+  public void testShreddedVariantConversionThrows() {
+    HoodieSchema.Variant shredded = HoodieSchema.createVariantShredded(
+        HoodieSchema.create(HoodieSchemaType.STRING));
+    UnsupportedOperationException ex = assertThrows(
+        UnsupportedOperationException.class,
+        () -> HoodieSchemaConverter.convertToDataType(shredded));
+    assertTrue(ex.getMessage().contains("Shredded Variant is not yet supported in Flink"));
   }
 
   @Test
