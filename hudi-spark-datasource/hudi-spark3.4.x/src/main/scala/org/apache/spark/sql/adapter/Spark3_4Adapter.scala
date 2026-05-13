@@ -24,6 +24,7 @@ import org.apache.hudi.storage.StorageConfiguration
 import org.apache.avro.Schema
 import org.apache.hadoop.conf.Configuration
 import org.apache.parquet.schema.MessageType
+import org.apache.spark.SparkEnv
 import org.apache.spark.api.java.JavaSparkContext
 import org.apache.spark.sql._
 import org.apache.spark.sql.avro._
@@ -42,6 +43,7 @@ import org.apache.spark.sql.execution.datasources.orc.Spark34OrcReader
 import org.apache.spark.sql.execution.datasources.parquet.{ParquetFileFormat, ParquetFilters, Spark34LegacyHoodieParquetFileFormat, Spark34ParquetReader}
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.hudi.analysis.TableValuedFunctions
+import org.apache.spark.sql.hudi.blob.{BatchedBlobReaderStrategy, ScalarFunctions}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.SQLConf.LegacyBehaviorPolicy
 import org.apache.spark.sql.parser.{HoodieExtendedParserInterface, HoodieSpark3_4ExtendedSqlParser}
@@ -115,6 +117,16 @@ class Spark3_4Adapter extends BaseSpark3Adapter {
     TableValuedFunctions.funcs.foreach(extensions.injectTableFunction)
   }
 
+  override def injectScalarFunctions(extensions: SparkSessionExtensions): Unit = {
+    ScalarFunctions.funcs.foreach(extensions.injectFunction)
+  }
+
+  override def injectPlannerStrategies(extensions: SparkSessionExtensions): Unit = {
+    extensions.injectPlannerStrategy { session =>
+      BatchedBlobReaderStrategy(session)
+    }
+  }
+
   /**
    * Converts instance of [[StorageLevel]] to a corresponding string
    */
@@ -167,7 +179,13 @@ class Spark3_4Adapter extends BaseSpark3Adapter {
   }
 
   override def getDateTimeRebaseMode(): LegacyBehaviorPolicy.Value = {
-    LegacyBehaviorPolicy.withName(SQLConf.get.getConf(SQLConf.PARQUET_REBASE_MODE_IN_WRITE))
+    // See Spark3_5Adapter.getDateTimeRebaseMode for the rationale.
+    val fromSqlConf = Option(SQLConf.get.getConf(SQLConf.PARQUET_REBASE_MODE_IN_WRITE, null))
+    val fromSparkConf = Option(SparkEnv.get)
+      .flatMap(env => Option(env.conf.get(SQLConf.PARQUET_REBASE_MODE_IN_WRITE.key, null)))
+    LegacyBehaviorPolicy.withName(
+      fromSqlConf.orElse(fromSparkConf)
+        .getOrElse(SQLConf.get.getConf(SQLConf.PARQUET_REBASE_MODE_IN_WRITE)))
   }
 
   override def isLegacyBehaviorPolicy(value: Object): Boolean = {

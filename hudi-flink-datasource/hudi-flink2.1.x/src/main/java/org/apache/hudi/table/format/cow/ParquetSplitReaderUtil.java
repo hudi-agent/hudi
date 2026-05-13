@@ -18,6 +18,7 @@
 
 package org.apache.hudi.table.format.cow;
 
+import org.apache.hudi.common.schema.HoodieSchema;
 import org.apache.hudi.common.util.ValidationUtils;
 import org.apache.hudi.table.format.cow.vector.HeapArrayGroupColumnVector;
 import org.apache.hudi.table.format.cow.vector.HeapArrayVector;
@@ -69,6 +70,7 @@ import org.apache.flink.table.types.logical.LogicalTypeRoot;
 import org.apache.flink.table.types.logical.MapType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.logical.TimestampType;
+import org.apache.flink.table.types.logical.VarBinaryType;
 import org.apache.flink.util.Preconditions;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.parquet.ParquetRuntimeException;
@@ -320,6 +322,15 @@ public class ParquetSplitReaderUtil {
         } else {
           throw new UnsupportedOperationException("Unsupported create row with default value.");
         }
+      case VARIANT:
+        HeapRowColumnVector variantVector = new HeapRowColumnVector(batchSize,
+            new WritableColumnVector[]{new HeapBytesVector(batchSize), new HeapBytesVector(batchSize)});
+        if (value == null) {
+          variantVector.fillWithNulls();
+          return variantVector;
+        } else {
+          throw new UnsupportedOperationException("Unsupported create variant with default value.");
+        }
       default:
         throw new UnsupportedOperationException("Unsupported type: " + type);
     }
@@ -498,6 +509,23 @@ public class ParquetSplitReaderUtil {
           }
         }
         return new RowColumnReader(fieldReaders);
+      case VARIANT:
+        // Top-level variant columns only. Nested variant (e.g. ARRAY<VARIANT>, ROW<..., VARIANT>)
+        // is not yet supported — see ColumnarGroupRowData.getVariant() / ColumnarGroupArrayData.getVariant().
+        //
+        // Variant is stored in Parquet as a group with binary "metadata" and "value" fields.
+        // VectorizedColumnBatch.getVariant() expects child order [value(0), metadata(1)]
+        // to match the BinaryVariant(value, metadata) constructor.
+        GroupType variantGroup = physicalType.asGroupType();
+        int valueIdx = variantGroup.getFieldIndex(HoodieSchema.Variant.VARIANT_VALUE_FIELD);
+        int metadataIdx = variantGroup.getFieldIndex(HoodieSchema.Variant.VARIANT_METADATA_FIELD);
+        List<ColumnDescriptor> variantDescs = filterDescriptors(depth + 1, variantGroup.getType(valueIdx), columns);
+        ColumnDescriptor valueDesc = variantDescs.get(0);
+        List<ColumnDescriptor> metaDescs = filterDescriptors(depth + 1, variantGroup.getType(metadataIdx), columns);
+        ColumnDescriptor metaDesc = metaDescs.get(0);
+        return new RowColumnReader(Arrays.asList(
+            new BytesColumnReader(valueDesc, pages.getPageReader(valueDesc)),
+            new BytesColumnReader(metaDesc, pages.getPageReader(metaDesc))));
       default:
         throw new UnsupportedOperationException(fieldType + " is not supported now.");
     }
@@ -675,6 +703,18 @@ public class ParquetSplitReaderUtil {
           }
         }
         return new HeapRowColumnVector(batchSize, columnVectors);
+      case VARIANT:
+        // Top-level variant columns only — nested variant is not yet supported.
+        // Variant is physically a group with two BINARY children (metadata, value).
+        // Child order must be [value(0), metadata(1)] for VectorizedColumnBatch.getVariant().
+        GroupType variantGroup = physicalType.asGroupType();
+        int valueIdx = variantGroup.getFieldIndex(HoodieSchema.Variant.VARIANT_VALUE_FIELD);
+        int metadataIdx = variantGroup.getFieldIndex(HoodieSchema.Variant.VARIANT_METADATA_FIELD);
+        WritableColumnVector valueVector = createWritableColumnVector(
+            batchSize, new VarBinaryType(), variantGroup.getType(valueIdx), columns, depth + 1);
+        WritableColumnVector metadataVector = createWritableColumnVector(
+            batchSize, new VarBinaryType(), variantGroup.getType(metadataIdx), columns, depth + 1);
+        return new HeapRowColumnVector(batchSize, new WritableColumnVector[]{valueVector, metadataVector});
       default:
         throw new UnsupportedOperationException(fieldType + " is not supported now.");
     }

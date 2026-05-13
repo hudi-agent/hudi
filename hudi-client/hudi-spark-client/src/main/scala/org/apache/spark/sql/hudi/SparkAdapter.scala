@@ -77,6 +77,17 @@ trait SparkAdapter extends Serializable {
   def injectTableFunctions(extensions: SparkSessionExtensions): Unit = {}
 
   /**
+   * Inject scalar functions into Spark SQL function registry.
+   * These functions can be used in SQL SELECT clauses.
+   */
+  def injectScalarFunctions(extensions: SparkSessionExtensions): Unit
+
+  /**
+   * Inject planner strategies to SparkSessionExtensions for converting custom logical plans into physical plans.
+   */
+  def injectPlannerStrategies(extensions: SparkSessionExtensions): Unit
+
+  /**
    * Returns an instance of [[HoodieCatalystExpressionUtils]] providing for common utils operating
    * on Catalyst [[Expression]]s
    */
@@ -483,4 +494,32 @@ trait SparkAdapter extends Serializable {
     shreddedStructType: StructType,
     writeStruct: Consumer[InternalRow]
   ): BiConsumer[SpecializedGetters, Integer]
+
+  /**
+   * Creates a [[HoodieMemoryStream]] wrapper around Spark's MemoryStream.
+   * This abstracts the package differences between Spark versions:
+   * - Spark 3.x/4.0: org.apache.spark.sql.execution.streaming.MemoryStream
+   * - Spark 4.1+: org.apache.spark.sql.execution.streaming.runtime.MemoryStream
+   *
+   * @param id           ID for the MemoryStream
+   * @param sparkSession [[SparkSession]] object
+   * @param encoder      Implicit encoder for type T
+   * @return A [[HoodieMemoryStream]] wrapper
+   */
+  def createMemoryStream[T: Encoder](id: Int, sparkSession: SparkSession): HoodieMemoryStream[T]
+}
+
+/**
+ * Wrapper trait for Spark's MemoryStream to abstract package differences across Spark versions.
+ */
+trait HoodieMemoryStream[T] {
+  /**
+   * Add data to the stream.
+   */
+  def addData(data: TraversableOnce[T]): Unit
+
+  /**
+   * Convert the stream to a Dataset.
+   */
+  def toDS(): Dataset[T]
 }

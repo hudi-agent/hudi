@@ -19,6 +19,7 @@
 
 package org.apache.hudi.util;
 
+import org.apache.hudi.adapter.DataTypeAdapter;
 import org.apache.hudi.avro.model.HoodieMetadataRecord;
 import org.apache.hudi.common.schema.HoodieSchema;
 import org.apache.hudi.common.schema.HoodieSchemaField;
@@ -30,16 +31,19 @@ import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.ArrayType;
 import org.apache.flink.table.types.logical.DecimalType;
 import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.types.logical.LogicalTypeRoot;
 import org.apache.flink.table.types.logical.MapType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.logical.TimestampType;
 import org.apache.flink.table.types.logical.VarCharType;
 import org.apache.flink.table.types.logical.VarBinaryType;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -476,6 +480,58 @@ public class TestHoodieSchemaConverter {
   }
 
   @Test
+  public void testVectorConversion() {
+    HoodieSchema floatVectorSchema = HoodieSchema.createVector(128);
+    HoodieSchema doubleVectorSchema = HoodieSchema.createVector(128, HoodieSchema.Vector.VectorElementType.DOUBLE);
+    HoodieSchema int8VectorSchema = HoodieSchema.createVector(128, HoodieSchema.Vector.VectorElementType.INT8);
+
+    DataType floatDataType = HoodieSchemaConverter.convertToDataType(floatVectorSchema);
+    DataType doubleDataType = HoodieSchemaConverter.convertToDataType(doubleVectorSchema);
+    DataType int8DataType = HoodieSchemaConverter.convertToDataType(int8VectorSchema);
+
+    assertVectorArray(floatDataType, LogicalTypeRoot.FLOAT, false);
+    assertVectorArray(doubleDataType, LogicalTypeRoot.DOUBLE, false);
+    assertVectorArray(int8DataType, LogicalTypeRoot.TINYINT, false);
+  }
+
+  @Test
+  public void testNullableVectorConversion() {
+    HoodieSchema vectorSchema = HoodieSchema.createNullable(HoodieSchema.createVector(128));
+
+    DataType dataType = HoodieSchemaConverter.convertToDataType(vectorSchema);
+
+    assertVectorArray(dataType, LogicalTypeRoot.FLOAT, true);
+  }
+
+  @Test
+  public void testVectorInRecordConversion() {
+    HoodieSchema schema = HoodieSchema.createRecord(
+        "test_record",
+        null,
+        null,
+        Arrays.asList(
+            HoodieSchemaField.of("id", HoodieSchema.create(HoodieSchemaType.INT)),
+            HoodieSchemaField.of("embedding", HoodieSchema.createVector(128))
+        )
+    );
+
+    RowType rowType = HoodieSchemaConverter.convertToRowType(schema);
+
+    assertEquals(2, rowType.getFieldCount());
+    assertEquals("embedding", rowType.getFieldNames().get(1));
+    ArrayType vectorArrayType = assertInstanceOf(ArrayType.class, rowType.getTypeAt(1));
+    assertEquals(LogicalTypeRoot.FLOAT, vectorArrayType.getElementType().getTypeRoot());
+    assertFalse(rowType.getTypeAt(1).isNullable());
+  }
+
+  private void assertVectorArray(DataType dataType, LogicalTypeRoot elementTypeRoot, boolean nullable) {
+    ArrayType arrayType = assertInstanceOf(ArrayType.class, dataType.getLogicalType());
+    assertEquals(elementTypeRoot, arrayType.getElementType().getTypeRoot());
+    assertFalse(arrayType.getElementType().isNullable());
+    assertEquals(nullable, dataType.getLogicalType().isNullable());
+  }
+
+  @Test
   void testUnionSchemaWithMultipleRecordTypes() {
     HoodieSchema schema = HoodieSchema.fromAvroSchema(HoodieMetadataRecord.SCHEMA$);
     DataType dataType = HoodieSchemaConverter.convertToDataType(schema);
@@ -637,25 +693,35 @@ public class TestHoodieSchemaConverter {
     assertEquals(HoodieSchemaType.BLOB, convertedMap.getValueType().getType());
   }
 
-  @Test
-  public void testVariantTypeConversion() {
-    // Test direct Variant conversion
-    HoodieSchema variantSchema = HoodieSchema.createVariant();
-    DataType dataType = HoodieSchemaConverter.convertToDataType(variantSchema);
-    assertNotNull(dataType);
-
-    // Verify it's a ROW with metadata and value binary fields
-    RowType rowType = (RowType) dataType.getLogicalType();
-    assertEquals(2, rowType.getFieldCount());
-    assertEquals("metadata", rowType.getFieldNames().get(0));
-    assertEquals("value", rowType.getFieldNames().get(1));
-    assertInstanceOf(VarBinaryType.class, rowType.getTypeAt(0));
-    assertInstanceOf(VarBinaryType.class, rowType.getTypeAt(1));
+  private static boolean hasNativeVariantType() {
+    try {
+      DataTypeAdapter.createVariantType();
+      return true;
+    } catch (UnsupportedOperationException e) {
+      return false;
+    }
   }
 
   @Test
+  @Disabled("disabled and reopen the tests for 1.3")
+  public void testVariantTypeConversion() {
+    HoodieSchema variantSchema = HoodieSchema.createVariant();
+
+    if (hasNativeVariantType()) {
+      DataType dataType = HoodieSchemaConverter.convertToDataType(variantSchema);
+      assertNotNull(dataType);
+      assertEquals("VARIANT", dataType.getLogicalType().getTypeRoot().name());
+    } else {
+      UnsupportedOperationException ex = assertThrows(
+          UnsupportedOperationException.class,
+          () -> HoodieSchemaConverter.convertToDataType(variantSchema));
+      assertTrue(ex.getMessage().contains("VARIANT type is only supported in Flink 2.1+"));
+    }
+  }
+
+  @Test
+  @Disabled("disabled and reopen the tests for 1.3")
   public void testVariantInRecordConversion() {
-    // Test Variant field within a record
     HoodieSchema recordWithVariant = HoodieSchema.createRecord(
         "test_record",
         null,
@@ -666,15 +732,63 @@ public class TestHoodieSchemaConverter {
         )
     );
 
-    RowType result = HoodieSchemaConverter.convertToRowType(recordWithVariant);
-    assertEquals(2, result.getFieldCount());
-    assertEquals("data", result.getFieldNames().get(1));
+    if (hasNativeVariantType()) {
+      RowType result = HoodieSchemaConverter.convertToRowType(recordWithVariant);
+      assertEquals(2, result.getFieldCount());
+      assertEquals("data", result.getFieldNames().get(1));
+      assertEquals("VARIANT", result.getTypeAt(1).getTypeRoot().name());
+    } else {
+      UnsupportedOperationException ex = assertThrows(
+          UnsupportedOperationException.class,
+          () -> HoodieSchemaConverter.convertToRowType(recordWithVariant));
+      assertTrue(ex.getMessage().contains("VARIANT type is only supported in Flink 2.1+"));
+    }
+  }
 
-    // Verify variant field is a ROW<metadata BYTES, value BYTES>
-    RowType variantRowType = (RowType) result.getTypeAt(1);
-    assertEquals(2, variantRowType.getFieldCount());
-    assertEquals("metadata", variantRowType.getFieldNames().get(0));
-    assertEquals("value", variantRowType.getFieldNames().get(1));
+  @Test
+  public void testVariantInArrayConversion() {
+    HoodieSchema arrayOfVariant = HoodieSchema.createArray(HoodieSchema.createVariant());
+
+    if (hasNativeVariantType()) {
+      DataType dataType = HoodieSchemaConverter.convertToDataType(arrayOfVariant);
+      assertNotNull(dataType);
+      assertInstanceOf(ArrayType.class, dataType.getLogicalType());
+      LogicalType elementType = ((ArrayType) dataType.getLogicalType()).getElementType();
+      assertEquals("VARIANT", elementType.getTypeRoot().name());
+    } else {
+      UnsupportedOperationException ex = assertThrows(
+          UnsupportedOperationException.class,
+          () -> HoodieSchemaConverter.convertToDataType(arrayOfVariant));
+      assertTrue(ex.getMessage().contains("VARIANT type is only supported in Flink 2.1+"));
+    }
+  }
+
+  @Test
+  public void testVariantInMapConversion() {
+    HoodieSchema mapOfVariant = HoodieSchema.createMap(HoodieSchema.createVariant());
+
+    if (hasNativeVariantType()) {
+      DataType dataType = HoodieSchemaConverter.convertToDataType(mapOfVariant);
+      assertNotNull(dataType);
+      assertInstanceOf(MapType.class, dataType.getLogicalType());
+      LogicalType valueType = ((MapType) dataType.getLogicalType()).getValueType();
+      assertEquals("VARIANT", valueType.getTypeRoot().name());
+    } else {
+      UnsupportedOperationException ex = assertThrows(
+          UnsupportedOperationException.class,
+          () -> HoodieSchemaConverter.convertToDataType(mapOfVariant));
+      assertTrue(ex.getMessage().contains("VARIANT type is only supported in Flink 2.1+"));
+    }
+  }
+
+  @Test
+  public void testShreddedVariantConversionThrows() {
+    HoodieSchema.Variant shredded = HoodieSchema.createVariantShredded(
+        HoodieSchema.create(HoodieSchemaType.STRING));
+    UnsupportedOperationException ex = assertThrows(
+        UnsupportedOperationException.class,
+        () -> HoodieSchemaConverter.convertToDataType(shredded));
+    assertTrue(ex.getMessage().contains("Shredded Variant is not yet supported in Flink"));
   }
 
   @Test

@@ -300,6 +300,14 @@ public class HoodieWriteConfig extends HoodieConfig {
       .withDocumentation("Enables a more efficient mechanism for rollbacks based on the marker files generated "
           + "during the writes. Turned on by default.");
 
+  public static final ConfigProperty<String> ROLLBACK_AVOID_DUPLICATE_PLAN = ConfigProperty
+      .key("hoodie.rollback.avoid.duplicate.plan")
+      .defaultValue("false")
+      .markAdvanced()
+      .withDocumentation("When enabled in multi-writer mode, before scheduling a new rollback plan, the writer reloads "
+          + "the timeline under lock to check if another writer already scheduled one for the same failed commit. "
+          + "This avoids duplicate rollback instants and uses heartbeats to ensure only one writer executes the rollback at a time.");
+
   public static final ConfigProperty<String> FAIL_JOB_ON_DUPLICATE_DATA_FILE_DETECTION = ConfigProperty
       .key("hoodie.fail.job.on.duplicate.data.file.detection")
       .defaultValue("false")
@@ -760,21 +768,22 @@ public class HoodieWriteConfig extends HoodieConfig {
       .markAdvanced()
       .sinceVersion("1.2.0")
       .withDocumentation("Comma-separated list of extra metadata keys that should be automatically carried forward "
-          + "to every new commit. These keys will be read from recent commit metadata and included in new commits, "
-          + "ensuring they remain accessible without walking the timeline or worrying about archival. "
-          + "This is useful for tracking checkpoint information (e.g., Kafka offsets, Flink checkpoints) or any metadata "
-          + "that needs to persist across commits. New values override old ones. Only applies to data table commits.");
+          + "to every new commit and clean instant. These keys will be read from recent commit and clean metadata "
+          + "and included in new commits/cleans, ensuring they remain accessible without walking the timeline or "
+          + "worrying about archival. This is useful for tracking checkpoint information (e.g., Kafka offsets, "
+          + "Flink checkpoints) or any metadata that needs to persist across commits. New values override old ones. "
+          + "Only applies to data table commits and clean instants.");
 
   public static final ConfigProperty<Integer> ROLLING_METADATA_TIMELINE_LOOKBACK_COMMITS = ConfigProperty
       .key("hoodie.write.rolling.metadata.timeline.lookback.commits")
       .defaultValue(10)
       .markAdvanced()
       .sinceVersion("1.2.0")
-      .withDocumentation("Maximum number of completed commits to walk back in the timeline when searching for "
-          + "rolling metadata keys. If a rolling metadata key is not found in the latest commit, the system will "
-          + "walk back up to this many commits to find the most recent value. This ensures rolling metadata is "
-          + "preserved even if some commits don't update all keys. Higher values provide more resilience but may "
-          + "impact performance. Only applies when hoodie.write.rolling.metadata.keys is configured.");
+      .withDocumentation("Maximum number of completed instants (commits and clean) to walk back in the timeline "
+          + "when searching for rolling metadata keys. If a rolling metadata key is not found in the latest instant, "
+          + "the system will walk back up to this many instants to find the most recent value. This ensures rolling "
+          + "metadata is preserved even if some instants don't carry all keys. Higher values provide more resilience "
+          + "but may impact performance. Only applies when hoodie.write.rolling.metadata.keys is configured.");
 
   public static final ConfigProperty<Boolean> ALLOW_OPERATION_METADATA_FIELD = ConfigProperty
       .key("hoodie.allow.operation.metadata.field")
@@ -1601,6 +1610,10 @@ public class HoodieWriteConfig extends HoodieConfig {
     return getBoolean(ROLLBACK_USING_MARKERS_ENABLE);
   }
 
+  public boolean shouldAvoidDuplicateRollbackPlan() {
+    return getBoolean(ROLLBACK_AVOID_DUPLICATE_PLAN) && getWriteConcurrencyMode().supportsMultiWriter();
+  }
+
   public boolean enableComplexKeygenValidation() {
     return getBoolean(ENABLE_COMPLEX_KEYGEN_VALIDATION);
   }
@@ -1865,6 +1878,10 @@ public class HoodieWriteConfig extends HoodieConfig {
     return getBoolean(HoodieCleanConfig.AUTO_CLEAN);
   }
 
+  public long getIntervalToCreateEmptyCleanHours() {
+    return getLong(HoodieCleanConfig.INTERVAL_TO_CREATE_EMPTY_CLEAN_HOURS);
+  }
+
   public boolean shouldArchiveBeyondSavepoint() {
     return getBooleanOrDefault(HoodieArchivalConfig.ARCHIVE_BEYOND_SAVEPOINT);
   }
@@ -2000,6 +2017,10 @@ public class HoodieWriteConfig extends HoodieConfig {
 
   public int getCommitArchivalBatchSize() {
     return getInt(HoodieArchivalConfig.COMMITS_ARCHIVAL_BATCH_SIZE);
+  }
+
+  public boolean shouldBlockArchivalOnCleanECTR() {
+    return getBoolean(HoodieArchivalConfig.BLOCK_ARCHIVAL_ON_LATEST_CLEAN_ECTR);
   }
 
   public Boolean shouldCleanBootstrapBaseFile() {

@@ -18,6 +18,8 @@
 
 package org.apache.hudi.io.storage.row.parquet;
 
+import org.apache.hudi.adapter.DataTypeAdapter;
+import org.apache.hudi.common.schema.HoodieSchema;
 import org.apache.hudi.common.util.collection.Pair;
 
 import lombok.extern.slf4j.Slf4j;
@@ -46,6 +48,17 @@ import static org.apache.parquet.schema.LogicalTypeAnnotation.TimeUnit;
 
 /**
  * Schema converter converts Parquet schema to and from Flink internal types.
+ *
+ * <p>On reads, this converter performs best-effort physical type mapping. It does detect the
+ * Parquet {@code VARIANT} annotation (parquet-java 1.15.2+) and will reject shredded variants,
+ * but it cannot distinguish Hudi Blob or Vector types from ordinary binary columns. For full
+ * Hudi logical type inference, callers should derive the Flink RowType from the table-level
+ * {@link HoodieSchema} via {@code HoodieSchemaConverter.convertToDataType()} instead —
+ * see {@code HoodieRowDataParquetReader.withTableSchema()}.
+ *
+ * <p>On writes, this converter maps Flink {@code VariantType} to the canonical unshredded Parquet
+ * layout (group with binary metadata + value fields). Once parquet-java is bumped to 1.16.0+,
+ * the writer should also attach {@code LogicalTypeAnnotation.variantType()} for interoperability.
  *
  * <p>Reference org.apache.flink.formats.parquet.utils.ParquetSchemaConverter to support timestamp of INT64 8 bytes.
  */
@@ -155,6 +168,19 @@ public class ParquetSchemaConverter {
             new MapType(
                 convertToRowField(keyValueType.getLeft()).getType().copy(true),
                 convertToRowField(keyValueType.getRight()).getType()));
+      } else if (hasVariantAnnotation(logicalType)) {
+        // This branch only fires for files written with parquet-java 1.15.2+ that carry the
+        // VARIANT annotation. Note: convertToRowType() is not called by any production read
+        // path today — all reads derive the Flink RowType from HoodieSchema via
+        // RowDataQueryContexts.fromSchema(). This annotation check serves as defense-in-depth.
+        if (isShreddedVariant(groupType)) {
+          throw new UnsupportedOperationException(
+              "Shredded Variant is not supported in Flink. "
+                  + "The Parquet group '" + groupType.getName() + "' contains a '"
+                  + HoodieSchema.Variant.VARIANT_TYPED_VALUE_FIELD
+                  + "' field indicating a shredded layout.");
+        }
+        dataType = DataTypeAdapter.createVariantType();
       } else {
         dataType =
             DataTypes.of(new RowType(
@@ -188,6 +214,39 @@ public class ParquetSchemaConverter {
       types[i] = convertToParquetType(fieldName, fieldType, fieldType.isNullable() ? Type.Repetition.OPTIONAL : Type.Repetition.REQUIRED);
     }
     return new MessageType(name, types);
+  }
+
+  /**
+   * Checks whether the group carries the Parquet {@code VARIANT} logical type annotation.
+   * Uses class-name matching so this compiles against parquet-java versions that predate the
+   * {@code VariantLogicalTypeAnnotation} class (< 1.15.2).
+   */
+  private static boolean hasVariantAnnotation(LogicalTypeAnnotation logicalType) {
+    // needs to ensure the writer attach the variant annotation in 1.3.
+    return logicalType != null
+        && logicalType.getClass().getSimpleName().equals("VariantLogicalTypeAnnotation");
+  }
+
+  /**
+   * Checks whether a variant group contains a {@code typed_value} field, indicating a shredded
+   * layout. Called only after {@link #hasVariantAnnotation} returns true.
+   */
+  private static boolean isShreddedVariant(GroupType groupType) {
+    return groupType.containsField(HoodieSchema.Variant.VARIANT_TYPED_VALUE_FIELD);
+  }
+
+  /**
+   * Converts a Variant column to the canonical unshredded Parquet layout:
+   * a group with required binary {@code metadata} and required binary {@code value}.
+   */
+  private static Type convertVariantToParquetType(String name, Type.Repetition repetition) {
+    // TODO: add .as(LogicalTypeAnnotation.variantType()) once parquet-java is bumped to 1.16.0
+    return Types.buildGroup(repetition)
+        .addField(Types.primitive(PrimitiveType.PrimitiveTypeName.BINARY, Type.Repetition.REQUIRED)
+            .named(HoodieSchema.Variant.VARIANT_METADATA_FIELD))
+        .addField(Types.primitive(PrimitiveType.PrimitiveTypeName.BINARY, Type.Repetition.REQUIRED)
+            .named(HoodieSchema.Variant.VARIANT_VALUE_FIELD))
+        .named(name);
   }
 
   private static Type convertToParquetType(
@@ -304,6 +363,9 @@ public class ParquetSchemaConverter {
             .addField(convertToParquetType(field.getName(), field.getType(), field.getType().isNullable() ? Type.Repetition.OPTIONAL : Type.Repetition.REQUIRED)));
         return builder.named(name);
       default:
+        if (DataTypeAdapter.isVariantType(type)) {
+          return convertVariantToParquetType(name, repetition);
+        }
         throw new UnsupportedOperationException("Unsupported type: " + type);
     }
   }

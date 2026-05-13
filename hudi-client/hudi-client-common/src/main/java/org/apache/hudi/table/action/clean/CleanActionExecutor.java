@@ -21,6 +21,7 @@ package org.apache.hudi.table.action.clean;
 import org.apache.hudi.avro.model.HoodieActionInstant;
 import org.apache.hudi.avro.model.HoodieCleanMetadata;
 import org.apache.hudi.avro.model.HoodieCleanerPlan;
+import org.apache.hudi.client.BaseHoodieClient;
 import org.apache.hudi.client.transaction.TransactionManager;
 import org.apache.hudi.common.HoodieCleanStat;
 import org.apache.hudi.common.engine.HoodieEngineContext;
@@ -45,6 +46,7 @@ import lombok.extern.slf4j.Slf4j;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -52,6 +54,7 @@ import java.util.Map;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import static org.apache.hudi.common.util.CleanerUtils.CLEAN_METADATA_VERSION_2;
 import static org.apache.hudi.common.util.StringUtils.isNullOrEmpty;
 
 @Slf4j
@@ -134,9 +137,9 @@ public class CleanActionExecutor<T, I, K, O> extends BaseActionExecutor<T, I, K,
    * @throws IllegalArgumentException if unknown cleaning policy is provided
    */
   List<HoodieCleanStat> clean(HoodieEngineContext context, HoodieCleanerPlan cleanerPlan) {
-    int cleanerParallelism = Math.min(
+    int cleanerParallelism = Math.max(1, Math.min(
         cleanerPlan.getFilePathsToBeDeletedPerPartition().values().stream().mapToInt(List::size).sum(),
-        config.getCleanerParallelism());
+        config.getCleanerParallelism()));
     log.info("Using cleanerParallelism: {}", cleanerParallelism);
 
     context.setJobStatus(this.getClass().getSimpleName(), "Perform cleaning of table: " + config.getTableName());
@@ -155,7 +158,7 @@ public class CleanActionExecutor<T, I, K, O> extends BaseActionExecutor<T, I, K,
 
     List<String> partitionsToBeDeleted = table.getMetaClient().getTableConfig().isTablePartitioned() && cleanerPlan.getPartitionsToBeDeleted() != null
         ? cleanerPlan.getPartitionsToBeDeleted()
-        : new ArrayList<>();
+        : Collections.emptyList();
     partitionsToBeDeleted.forEach(entry -> {
       if (!isNullOrEmpty(entry)) {
         deleteFileAndGetResult(table.getStorage(), table.getMetaClient().getBasePath() + "/" + entry);
@@ -213,18 +216,22 @@ public class CleanActionExecutor<T, I, K, O> extends BaseActionExecutor<T, I, K,
       }
 
       List<HoodieCleanStat> cleanStats = clean(context, cleanerPlan);
+      HoodieCleanMetadata metadata;
       if (cleanStats.isEmpty()) {
-        return HoodieCleanMetadata.newBuilder().build();
+        metadata = createEmptyCleanMetadata(cleanerPlan, inflightInstant, timer.endTimer());
+      } else {
+        metadata = CleanerUtils.convertCleanMetadata(
+            inflightInstant.requestedTime(),
+            Option.of(timer.endTimer()),
+            cleanStats,
+            cleanerPlan.getExtraMetadata()
+        );
       }
-
-      table.getMetaClient().reloadActiveTimeline();
-      HoodieCleanMetadata metadata = CleanerUtils.convertCleanMetadata(
-          inflightInstant.requestedTime(),
-          Option.of(timer.endTimer()),
-          cleanStats,
-          cleanerPlan.getExtraMetadata()
-      );
       this.txnManager.beginStateChange(Option.of(inflightInstant), Option.empty());
+      // Reload inside the lock so mergeRollingMetadata reads the latest timeline,
+      // matching the same contract as mergeRollingMetadata for commit metadata.
+      table.getMetaClient().reloadActiveTimeline();
+      BaseHoodieClient.mergeRollingMetadata(table, config, metadata);
       writeTableMetadata(metadata, inflightInstant.requestedTime());
       table.getActiveTimeline().transitionCleanInflightToComplete(
           false,
@@ -236,6 +243,23 @@ public class CleanActionExecutor<T, I, K, O> extends BaseActionExecutor<T, I, K,
     } finally {
       this.txnManager.endStateChange(Option.ofNullable(inflightInstant));
     }
+  }
+
+  private static HoodieCleanMetadata createEmptyCleanMetadata(HoodieCleanerPlan cleanerPlan, HoodieInstant inflightInstant, long timeTakenMillis) {
+    ValidationUtils.checkArgument(cleanerPlan.getEarliestInstantToRetain() != null, "For empty cleans, earliest instant to retain can never be null");
+    HoodieCleanMetadata.Builder cleanMetadataBuilder = HoodieCleanMetadata.newBuilder()
+        .setStartCleanTime(inflightInstant.requestedTime())
+        .setTimeTakenInMillis(timeTakenMillis)
+        .setTotalFilesDeleted(0)
+        .setLastCompletedCommitTimestamp(cleanerPlan.getLastCompletedCommitTimestamp())
+        .setVersion(CLEAN_METADATA_VERSION_2)
+        .setPartitionMetadata(Collections.emptyMap())
+        .setExtraMetadata(cleanerPlan.getExtraMetadata())
+        .setBootstrapPartitionMetadata(Collections.emptyMap());
+    if (cleanerPlan.getEarliestInstantToRetain() != null) {
+      cleanMetadataBuilder.setEarliestCommitToRetain(cleanerPlan.getEarliestInstantToRetain().getTimestamp());
+    }
+    return cleanMetadataBuilder.build();
   }
 
   @Override
