@@ -103,4 +103,29 @@ public class HoodieReaderConfig extends HoodieConfig {
           + "from the cache after this duration to prevent memory leaks. "
           + "Only effective when hfile.block.cache.enabled is true.");
 
+  public static final String BLOB_INLINE_READ_MODE_CONTENT = "CONTENT";
+  public static final String BLOB_INLINE_READ_MODE_DESCRIPTOR = "DESCRIPTOR";
+  public static final ConfigProperty<String> BLOB_INLINE_READ_MODE = ConfigProperty
+      .key("hoodie.read.blob.inline.mode")
+      .defaultValue(BLOB_INLINE_READ_MODE_CONTENT)
+      .markAdvanced()
+      .sinceVersion("1.2.0")
+      .withValidValues(BLOB_INLINE_READ_MODE_CONTENT, BLOB_INLINE_READ_MODE_DESCRIPTOR)
+      .withDocumentation("How Hudi interprets INLINE BLOB values on read for plain column access "
+          + "(e.g. SELECT *). "
+          + "CONTENT (default) returns the raw inline bytes in the data field. "
+          + "DESCRIPTOR suppresses the inline bytes (data field is null) so direct column reads "
+          + "avoid the I/O cost of materializing large binary payloads. "
+          + "For Lance files, the reference struct is populated with blob stream coordinates. "
+          + "For Parquet files, the data column is skipped via nested column projection and the "
+          + "reference struct is null. "
+          + "read_blob() is the canonical bytes-materializing API and always returns bytes "
+          + "regardless of this setting; under DESCRIPTOR mode the engine reads the data column "
+          + "only for the blob columns referenced by read_blob() in the query.");
+
+  // Internal-only key set by ReadBlobRule on a per-query HadoopFsRelation.options to instruct
+  // the reader to skip the DESCRIPTOR data-column strip for the listed blob columns, so that
+  // read_blob() sees the materialized bytes. Comma-separated top-level column names. Not user-facing.
+  public static final String BLOB_INLINE_READ_FORCE_CONTENT_COLUMNS =
+      "hoodie.internal.read.blob.inline.force.content.columns";
 }

@@ -353,9 +353,9 @@ public abstract class BaseHoodieClient implements Serializable, AutoCloseable {
       Map<String, String> foundRollingMetadata = new HashMap<>();
       Set<String> remainingKeys = new HashSet<>(rollingKeys);
 
-      // Remove keys that are already present in current commit (current values take precedence)
+      // Remove keys that are already present with non-empty values in current commit (current values take precedence)
       for (String key : rollingKeys) {
-        if (existingExtraMetadata.containsKey(key)) {
+        if (existingExtraMetadata.containsKey(key) && !StringUtils.isNullOrEmpty(existingExtraMetadata.get(key))) {
           remainingKeys.remove(key);
         }
       }
@@ -387,7 +387,7 @@ public abstract class BaseHoodieClient implements Serializable, AutoCloseable {
         // Check for remaining keys in this commit
         for (String key : new HashSet<>(remainingKeys)) {
           String value = commitMetadata.getMetadata(key);
-          if (value != null) {
+          if (!StringUtils.isNullOrEmpty(value)) {
             foundRollingMetadata.put(key, value);
             remainingKeys.remove(key);
             log.debug("Found rolling metadata key '{}' in commit {} with value: {}",
