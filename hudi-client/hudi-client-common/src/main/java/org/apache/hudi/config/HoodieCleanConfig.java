@@ -250,6 +250,16 @@ public class HoodieCleanConfig extends HoodieConfig {
       .markAdvanced()
       .withDocumentation("Maximum number of commits to clean in one clean commit. Applicable only when the clean policy is based on KEEP_LATEST_COMMITS or KEEP_LATEST_HOURS");
 
+  public static final ConfigProperty<Long> INTERVAL_TO_CREATE_EMPTY_CLEAN_HOURS = ConfigProperty
+      .key("hoodie.write.empty.clean.interval.hours")
+      .defaultValue(-1L)
+      .markAdvanced()
+      .withDocumentation("In some cases empty clean commit needs to be created to ensure the clean planner "
+          + "does not look through entire dataset if there are no clean plans. This is possible for append-only "
+          + "dataset. Also, for these datasets we cannot ignore clean completely since in the future there could "
+          + "be upsert or replace operations. By creating empty clean commit, earliest_commit_to_retain value "
+          + "will be updated so that now clean planner can only check for partitions that are modified after the "
+          + "last empty clean's earliest_commit_toRetain value thereby optimizing the clean planning");
 
   /** @deprecated Use {@link #CLEANER_POLICY} and its methods instead */
   @Deprecated
@@ -426,6 +436,11 @@ public class HoodieCleanConfig extends HoodieConfig {
       return this;
     }
 
+    public HoodieCleanConfig.Builder withIntervalToCreateEmptyCleanHours(long emptyCleanIntervalHours) {
+      cleanConfig.setValue(INTERVAL_TO_CREATE_EMPTY_CLEAN_HOURS, String.valueOf(emptyCleanIntervalHours));
+      return this;
+    }
+
     public HoodieCleanConfig build() {
       cleanConfig.setDefaults(HoodieCleanConfig.class.getName());
       HoodieCleaningPolicy.valueOf(cleanConfig.getString(CLEANER_POLICY));
@@ -433,6 +448,10 @@ public class HoodieCleanConfig extends HoodieConfig {
       long maxCommitsToClean = cleanConfig.getLong(MAX_COMMITS_TO_CLEAN);
       if (maxCommitsToClean < 1) {
         throw new IllegalArgumentException(MAX_COMMITS_TO_CLEAN.key() + " must be >= 1, but was " + maxCommitsToClean);
+      }
+      long emptyCleanIntervalHours = cleanConfig.getLong(INTERVAL_TO_CREATE_EMPTY_CLEAN_HOURS);
+      if (emptyCleanIntervalHours == 0 || emptyCleanIntervalHours < -1) {
+        throw new IllegalArgumentException(INTERVAL_TO_CREATE_EMPTY_CLEAN_HOURS.key() + " must be -1 (disabled) or >= 1, but was " + emptyCleanIntervalHours);
       }
       return cleanConfig;
     }

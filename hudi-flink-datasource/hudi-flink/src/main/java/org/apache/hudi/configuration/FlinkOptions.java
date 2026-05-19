@@ -309,6 +309,15 @@ public class FlinkOptions extends HoodieConfig {
           + "average memory size of caches for historical checkpoints.");
 
   @AdvancedConfig
+  public static final ConfigOption<Integer> INDEX_RLI_CACHE_CONCURRENT_PARTITIONS_NUM = ConfigOptions
+      .key("index.rli.cache.concurrent.partitions.num")
+      .intType()
+      .defaultValue(2)
+      .withDescription("Expected number of partitions whose partitioned RLI caches are updated concurrently. "
+          + "Used to infer the initial memory size for each partition cache as INDEX_RLI_CACHE_SIZE / concurrency "
+          + "when historical cache usage is unavailable.");
+
+  @AdvancedConfig
   public static final ConfigOption<Integer> INDEX_RLI_LOOKUP_MINIBATCH_SIZE = ConfigOptions
       .key("index.rli.lookup.minibatch.size")
       .intType()
@@ -748,6 +757,16 @@ public class FlinkOptions extends HoodieConfig {
           + "The order of entire written file is not guaranteed.");
 
   @AdvancedConfig
+  public static final ConfigOption<Integer> WRITE_BUFFER_SORT_CONTINUOUS_DRAIN_SIZE = ConfigOptions
+      .key("write.buffer.sort.continuous.drain.size")
+      .intType()
+      .defaultValue(1) // default drain 1 record at a time
+      .withDescription("Number of records to drain each time the max capacity is reached when using continuous sorting. "
+          + "Default value of 1 provides smooth, incremental draining. "
+          + "Can be increased for batching if needed (e.g., 10, 100). "
+          + "Larger values reduce drain frequency but may cause latency spikes.");
+
+  @AdvancedConfig
   public static final ConfigOption<Long> WRITE_BUFFER_SIZE = ConfigOptions
       .key("write.buffer.size")
       .longType()
@@ -764,7 +783,8 @@ public class FlinkOptions extends HoodieConfig {
       .withDescription("Buffer type for append write function: "
           + "NONE (no buffer sort, default), "
           + "BOUNDED_IN_MEMORY (double buffer with async write), "
-          + "DISRUPTOR (ring buffer with async write, recommended for better throughput)");
+          + "DISRUPTOR (ring buffer with async write, recommended for better throughput), "
+          + "CONTINUOUS_SORT (TreeMap-based continuous sorting with incremental draining)");
 
   @AdvancedConfig
   public static final ConfigOption<Integer> WRITE_BUFFER_DISRUPTOR_RING_SIZE = ConfigOptions
